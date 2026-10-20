@@ -1,5 +1,6 @@
 //! One control connection: the state of the session and what each command does (RFC 959 section 5, RFC 1123 section 4.1).
 
+use crate::active::{self, ActiveError};
 use crate::backend::{Backend, Entry, EntryKind, FsError, LoginContext, LoginError};
 use crate::codec::{Line, LineReader};
 use crate::command::{self, Command, ParseError, TypeArg};
@@ -11,14 +12,14 @@ use crate::path::FtpPath;
 use crate::reply::{Reply, text};
 use crate::time;
 use crate::tls::{self, Stream};
-use crate::transfer::{self, Event, Failure, Job, Work};
+use crate::transfer::{self, DataPort, Event, Failure, Job, Work};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -69,7 +70,7 @@ pub async fn serve<B: Backend>(stream: TcpStream, peer: SocketAddr, config: Arc<
         cwd: FtpPath::root(),
         ascii: false,
         facts: Facts::default(),
-        passive: None,
+        data_port: None,
         epsv_all: false,
         rest: None,
         transfer: None,
@@ -123,8 +124,9 @@ struct Session<B: Backend> {
     ascii: bool,
     /// The facts MLSD and MLST give (`OPTS MLST`)
     facts: Facts,
-    /// The listener of the passive data connection. A session has one: a new PASV or EPSV replaces it, and closes the old at once
-    passive: Option<TcpListener>,
+    /// Where the next data connection comes from: the listener of PASV or EPSV, or the address of PORT or EPRT. A session has one: a new command
+    /// replaces it, and a listener is closed at once
+    data_port: Option<DataPort>,
     /// `EPSV ALL` was sent: PASV is refused from then on (RFC 2428 section 4)
     epsv_all: bool,
     /// The offset of `REST`, for the next command
@@ -311,7 +313,8 @@ impl<B: Backend> Session<B> {
             },
             Command::Allo => self.reply(202, text::SUPERFLUOUS).await,
             Command::Ccc => self.reply(534, "Request denied for policy reasons.").await,
-            Command::Port(_) | Command::Eprt(_) => self.reply(502, "Active mode is not supported.").await,
+            Command::Port(argument) => self.active_mode(active::parse_port(&argument)).await,
+            Command::Eprt(argument) => self.active_mode(active::parse_eprt(&argument)).await,
             Command::Site(_) => self.reply(502, "SITE commands are not supported.").await,
             Command::Abor => self.reply(226, "No transfer in progress.").await,
             Command::Pasv => self.passive_mode(false).await,
@@ -712,13 +715,13 @@ impl<B: Backend> Session<B> {
     /// PASV and EPSV: a new listener, and the old one is closed first, so a session never holds two ports (RFC 959 section 4.1.2, RFC 2428)
     async fn passive_mode(&mut self, extended: bool) -> Outcome {
         if let Some(reply) = self.data_policy() {
-            self.passive = None;
+            self.data_port = None;
             return self.send_reply(reply).await;
         }
         if !extended && self.epsv_all {
             return self.reply(501, "PASV is not allowed after EPSV ALL.").await;
         }
-        self.passive = None;
+        self.data_port = None;
         let address = if extended {
             None
         } else {
@@ -738,7 +741,7 @@ impl<B: Backend> Session<B> {
             Ok(address) => address.port(),
             Err(_) => return self.reply(425, "Can't open data connection.").await,
         };
-        self.passive = Some(listener);
+        self.data_port = Some(DataPort::Passive(listener));
         match address {
             Some(ip) => self.reply(227, &passive::pasv_text(ip, port)).await,
             None => self.reply(229, &passive::epsv_text(port)).await,
@@ -764,6 +767,41 @@ impl<B: Backend> Session<B> {
                 IpAddr::V6(_) => Err(Reply::new(501, "PASV is for IPv4. Use EPSV.")),
             },
         }
+    }
+
+    /// The text of the 425 for a data command without a data connection announced
+    fn use_pasv_first(&self) -> &'static str {
+        if self.config.active_mode { "Use PORT, PASV or EPSV first." } else { "Use PASV or EPSV first." }
+    }
+
+    /// PORT and EPRT (RFC 959, RFC 2428): where the server connects to for the data connection. Only to the address of the client and only to ports from
+    /// 1024 up (RFC 2577 section 3), and with the policy of the data connections
+    async fn active_mode(&mut self, parsed: Result<SocketAddr, ActiveError>) -> Outcome {
+        if !self.config.active_mode {
+            return self.reply(502, "Active mode is not supported.").await;
+        }
+        if let Some(reply) = self.data_policy() {
+            self.data_port = None;
+            return self.send_reply(reply).await;
+        }
+        if self.epsv_all {
+            return self.reply(501, "PORT and EPRT are not allowed after EPSV ALL.").await;
+        }
+        let address = match parsed {
+            Ok(address) => address,
+            Err(ActiveError::Syntax) => return self.reply(501, text::SYNTAX_PARAMETERS).await,
+            Err(ActiveError::Protocol) => {
+                let version = if self.peer.is_ipv4() { "1" } else { "2" };
+                return self.reply(522, &format!("Network protocol not supported, use ({version})")).await;
+            }
+        };
+        if passive::canonical(address.ip()) != passive::canonical(self.peer.ip()) || address.port() < active::FIRST_PORT {
+            warn!(%address, "an active data connection to another address or a low port was refused");
+            self.data_port = None;
+            return self.reply(504, "The data connection can only go to your own address and to a port from 1024 up.").await;
+        }
+        self.data_port = Some(DataPort::Active(address));
+        self.reply(200, "PORT command successful.").await
     }
 
     async fn epsv(&mut self, argument: Option<&str>) -> Outcome {
@@ -801,8 +839,8 @@ impl<B: Backend> Session<B> {
         if let Some(reply) = self.data_policy() {
             return self.send_reply(reply).await;
         }
-        if self.passive.is_none() {
-            return self.reply(425, "Use PASV or EPSV first.").await;
+        if self.data_port.is_none() {
+            return self.reply(425, self.use_pasv_first()).await;
         }
         let path = match argument {
             Some(argument) => match self.resolve(&argument).await? {
@@ -828,8 +866,8 @@ impl<B: Backend> Session<B> {
         if let Some(reply) = self.data_policy() {
             return self.send_reply(reply).await;
         }
-        if self.passive.is_none() {
-            return self.reply(425, "Use PASV or EPSV first.").await;
+        if self.data_port.is_none() {
+            return self.reply(425, self.use_pasv_first()).await;
         }
         let Some(path) = self.resolve(argument).await? else { return Ok(None) };
         let Some(user) = self.user() else { return self.reply(530, text::NOT_LOGGED_IN).await };
@@ -851,8 +889,8 @@ impl<B: Backend> Session<B> {
         if let Some(reply) = self.data_policy() {
             return self.send_reply(reply).await;
         }
-        if self.passive.is_none() {
-            return self.reply(425, "Use PASV or EPSV first.").await;
+        if self.data_port.is_none() {
+            return self.reply(425, self.use_pasv_first()).await;
         }
         let Some(path) = self.resolve(argument).await? else { return Ok(None) };
         if path.is_root() {
@@ -871,14 +909,15 @@ impl<B: Backend> Session<B> {
         if let Some(reply) = self.data_policy() {
             return self.send_reply(reply).await;
         }
-        let Some(listener) = self.passive.take() else { return self.reply(425, "Use PASV or EPSV first.").await };
+        let Some(port) = self.data_port.take() else { return self.reply(425, self.use_pasv_first()).await };
         let Some(user) = self.user() else { return self.reply(530, text::NOT_LOGGED_IN).await };
         let (sender, receiver) = mpsc::channel(4);
         let progress = Arc::new(AtomicU64::new(0));
         let job = Job {
             backend: self.backend.clone(),
             user,
-            listener,
+            port,
+            local: self.local.ip(),
             client: self.peer.ip(),
             accept_timeout: self.config.limits.data_accept_timeout,
             idle_timeout: self.config.limits.transfer_idle_timeout,

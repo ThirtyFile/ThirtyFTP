@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod active;
 mod backend;
 mod codec;
 mod command;

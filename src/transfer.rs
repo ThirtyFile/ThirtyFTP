@@ -5,12 +5,13 @@
 //! section 4.1.3.3). The task never writes to the control connection: it tells the session with [`Event`]s, and the session sends the replies.
 //! Aborting the task drops everything it holds, including the backend's `write`, which is how an upload that did not complete is discarded.
 
+use crate::active;
 use crate::backend::{Backend, FsError};
 use crate::passive;
 use crate::path::FtpPath;
 use crate::tls::Stream;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,13 +55,21 @@ pub(crate) enum Work {
     Listing(Vec<u8>),
 }
 
+/// Where the data connection comes from: the client connects to a port of ours (PASV, EPSV), or we connect to the client (PORT, EPRT)
+pub(crate) enum DataPort {
+    Passive(TcpListener),
+    Active(SocketAddr),
+}
+
 /// What a transfer needs
 pub(crate) struct Job<B: Backend> {
     pub(crate) backend: Arc<B>,
     pub(crate) user: Arc<B::User>,
-    pub(crate) listener: TcpListener,
+    pub(crate) port: DataPort,
     /// The address of the client: a data connection from another address is closed
     pub(crate) client: IpAddr,
+    /// The address of the server the control connection came to: an active connection starts from it
+    pub(crate) local: IpAddr,
     pub(crate) accept_timeout: Duration,
     pub(crate) idle_timeout: Duration,
     /// The TLS settings of the data connection when its protection level is `P`
@@ -80,12 +89,20 @@ pub(crate) async fn run<B: Backend>(job: Job<B>, work: Work) {
 
 async fn transfer<B: Backend>(job: Job<B>, work: Work) -> Result<u64, Failure> {
     let deadline = Instant::now() + job.accept_timeout;
-    let tcp = match passive::accept_from(&job.listener, job.client, deadline).await {
-        Ok(stream) => stream,
-        Err(_) => return Err(Failure::NoConnection),
+    let tcp = match job.port {
+        DataPort::Passive(listener) => match passive::accept_from(&listener, job.client, deadline).await {
+            // One data connection for one transfer: the port is not needed any more
+            Ok(stream) => stream,
+            Err(_) => return Err(Failure::NoConnection),
+        },
+        DataPort::Active(address) => match active::connect(job.local, address, deadline).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                debug!(%error, %address, "no active data connection");
+                return Err(Failure::NoConnection);
+            }
+        },
     };
-    // One data connection for one transfer: the port is not needed any more
-    drop(job.listener);
     if job.events.send(Event::Started).await.is_err() {
         return Err(Failure::Aborted);
     }

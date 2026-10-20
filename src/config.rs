@@ -28,6 +28,10 @@ pub struct Config {
     pub passive_ports: RangeInclusive<u16>,
     /// The address `PASV` tells the client to connect to
     pub passive_host: PassiveHost,
+    /// Whether `PORT` and `EPRT` are done: the server then connects to the client for the data connection. Off by default: a client behind NAT or a
+    /// firewall can't use it, and it asks the server to open connections. When on, the server connects only to the address the control connection
+    /// comes from and only to ports from 1024 up (RFC 2577 section 3), and the TLS policy of the data connections applies as it does to passive mode
+    pub active_mode: bool,
     /// Limits against clients that send too much or too little
     pub limits: Limits,
 }
@@ -71,6 +75,7 @@ impl Default for Config {
             require_tls: false,
             passive_ports: 49152..=65535,
             passive_host: PassiveHost::default(),
+            active_mode: false,
             limits: Limits::default(),
         }
     }
