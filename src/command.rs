@@ -29,7 +29,7 @@ pub(crate) enum TypeArg {
 
 /// A command, with its argument
 #[derive(Debug, Clone, PartialEq, Eq)]
-// The commands that are refused (RMD, DELE, RNFR, RNTO, APPE, PORT, EPRT, SITE) are parsed with their arguments, which nothing reads
+// The commands that are refused (RMD, DELE, RNFR, RNTO, APPE, SITE) are parsed with their arguments, which nothing reads
 #[allow(dead_code)]
 pub(crate) enum Command {
     User(String),

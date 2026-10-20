@@ -1,6 +1,5 @@
 #![no_main]
 
-use async_trait::async_trait;
 use libfuzzer_sys::fuzz_target;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -11,7 +10,6 @@ use tokio::net::{TcpListener, TcpStream};
 /// A backend with one file and one directory, which accepts everything it is sent
 struct Tiny;
 
-#[async_trait]
 impl Backend for Tiny {
     type User = ();
 

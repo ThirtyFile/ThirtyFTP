@@ -1,0 +1,40 @@
+name: Report a problem
+description: The server does something it should not, or does not do what the specifications say
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Found a security problem?** Don't write it here. Use [Report a vulnerability](https://github.com/ThirtyFile/ThirtyFTP/security/advisories/new) so it stays private until it is fixed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Commands and replies
+      description: The lines the client sent and the server answered (the output of `curl -v` or `lftp -d`, or a capture of the control connection). Remove passwords.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version of thirtyftp
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client
+      placeholder: curl 8.9, FileZilla 3.68, a scanner or camera and its model
+  - type: textarea
+    id: config
+    attributes:
+      label: Settings
+      description: The settings that matter (`require_tls`, `active_mode`, `passive_ports`, `passive_host`, `ascii_conversion`) and a word on the backend.

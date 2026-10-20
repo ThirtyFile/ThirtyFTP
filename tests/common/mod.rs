@@ -2,7 +2,6 @@
 
 #![allow(dead_code)] // Each test file uses part of this
 
-use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
@@ -56,13 +55,16 @@ impl Memory {
     }
 }
 
-#[async_trait]
 impl Backend for Memory {
     type User = String;
 
     async fn login(&self, context: &LoginContext, user: &str, password: &str) -> Result<String, LoginError> {
         if *self.down.lock().unwrap() {
             return Err(LoginError::Unavailable);
+        }
+        if user == "slow" {
+            // A user store that does not answer
+            std::future::pending::<()>().await;
         }
         self.logins.lock().unwrap().push((context.clone(), user.to_string()));
         match (user, password) {
@@ -107,6 +109,9 @@ impl Backend for Memory {
     }
 
     async fn read(&self, _: &String, path: &FtpPath, offset: u64) -> Result<Box<dyn AsyncRead + Send + Unpin>, FsError> {
+        if path.file_name() == Some("unreadable.bin") {
+            return Err(FsError::Unavailable);
+        }
         match self.files.lock().unwrap().get(&path.to_string()) {
             Some(data) => Ok(Box::new(std::io::Cursor::new(data[(offset as usize).min(data.len())..].to_vec()))),
             None => Err(FsError::NotFound),
@@ -117,6 +122,14 @@ impl Backend for Memory {
         match path.file_name() {
             Some("full.bin") => return Err(FsError::QuotaExceeded),
             Some("busy.bin") => return Err(FsError::Unavailable),
+            Some("denied.bin") => return Err(FsError::PermissionDenied),
+            Some("badname.bin") => return Err(FsError::NameNotAllowed),
+            Some("early.bin") => {
+                // Returns after one chunk, as a backend with a size limit that forgot to say so
+                let mut one = [0u8; 4];
+                let _ = data.read(&mut one).await;
+                return Ok(4);
+            }
             Some("panic.bin") => panic!("the backend panics"),
             _ => {}
         }
@@ -127,7 +140,7 @@ impl Backend for Memory {
         let length = bytes.len() as u64;
         if path.file_name() == Some("slowend.bin") {
             // The storage takes its time after the last byte, as a big file being moved into place does
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::sleep(Duration::from_millis(2000)).await;
         }
         // Stored only when the data came to its end
         self.files.lock().unwrap().insert(path.to_string(), bytes);
@@ -147,6 +160,10 @@ impl Backend for Memory {
     }
 
     async fn change_dir(&self, _: &String, path: &FtpPath) -> Result<(), FsError> {
+        if path.file_name() == Some("hang") {
+            // A storage that does not answer
+            std::future::pending::<()>().await;
+        }
         if self.directories.lock().unwrap().contains(&path.to_string()) { Ok(()) } else { Err(FsError::NotFound) }
     }
 }
@@ -201,7 +218,12 @@ pub async fn start() -> Server {
 }
 
 pub async fn start_with(config: Config) -> Server {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    start_on("127.0.0.1:0", config).await
+}
+
+/// A server on an address, for example `[::1]:0`
+pub async fn start_on(bind: &str, config: Config) -> Server {
+    let listener = TcpListener::bind(bind).await.unwrap();
     let address = listener.local_addr().unwrap();
     let backend = Memory::new();
     let events = Arc::new(Recorder::default());
@@ -498,4 +520,71 @@ pub async fn eventually(mut check: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("the condition did not come true");
+}
+
+/// Connects a data connection
+pub async fn connect(address: SocketAddr) -> TcpStream {
+    TcpStream::connect(address).await.unwrap()
+}
+
+/// Reads a data connection to its end
+pub async fn read_all(mut stream: TcpStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut bytes)).await.expect("the data did not end").unwrap();
+    bytes
+}
+
+/// Sends a file through a new passive connection, and returns when `226` came
+pub async fn upload(client: &mut Client, name: &str, data: &[u8]) {
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code(&format!("STOR {name}")).await, 150);
+    stream.write_all(data).await.unwrap();
+    stream.shutdown().await.unwrap();
+    assert_eq!(client.reply().await.0, 226);
+}
+
+/// Receives a file through a new passive connection
+pub async fn download(client: &mut Client, name: &str) -> Vec<u8> {
+    let address = client.pasv().await;
+    let stream = connect(address).await;
+    assert_eq!(client.code(&format!("RETR {name}")).await, 150);
+    let data = read_all(stream).await;
+    assert_eq!(client.reply().await.0, 226);
+    data
+}
+
+/// Receives a listing (`LIST`, `NLST`, `MLSD`) through a new passive connection
+pub async fn listing(client: &mut Client, command: &str) -> String {
+    let address = client.pasv().await;
+    let stream = connect(address).await;
+    assert_eq!(client.code(command).await, 150, "{command}");
+    let data = read_all(stream).await;
+    assert_eq!(client.reply().await.0, 226, "{command}");
+    String::from_utf8(data).unwrap()
+}
+
+/// Bytes that are not the same from one place to the next
+pub fn pattern(length: usize) -> Vec<u8> {
+    (0..length).map(|i| (i * 7 + i / 251) as u8).collect()
+}
+
+/// A random generator with a seed, so that a failure can be repeated
+pub struct Random(pub u64);
+
+impl Random {
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    pub fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    pub fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[self.below(items.len())]
+    }
 }

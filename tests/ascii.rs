@@ -4,27 +4,6 @@ mod common;
 
 use common::*;
 use thirtyftp::Config;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
-async fn upload(client: &mut Client, name: &str, data: &[u8]) {
-    let address = client.pasv().await;
-    let mut stream = TcpStream::connect(address).await.unwrap();
-    assert_eq!(client.code(&format!("STOR {name}")).await, 150);
-    stream.write_all(data).await.unwrap();
-    stream.shutdown().await.unwrap();
-    assert_eq!(client.reply().await.0, 226);
-}
-
-async fn download(client: &mut Client, name: &str) -> Vec<u8> {
-    let address = client.pasv().await;
-    let mut stream = TcpStream::connect(address).await.unwrap();
-    assert_eq!(client.code(&format!("RETR {name}")).await, 150);
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data).await.unwrap();
-    assert_eq!(client.reply().await.0, 226);
-    data
-}
 
 const TEXT: &[u8] = b"line one\r\nline two\r\n\r\nlone\rcr\nbare lf\n";
 

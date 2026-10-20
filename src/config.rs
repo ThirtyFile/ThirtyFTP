@@ -49,7 +49,8 @@ pub enum PassiveHost {
     FromConnection,
     /// This IPv4 address: for a server behind NAT, the address of the router
     Ip(Ipv4Addr),
-    /// The IPv4 address of this name, looked up at each `PASV`: for a server behind NAT with a name that follows a changing address
+    /// The IPv4 address of this name: for a server behind NAT with a name that follows a changing address. The answer is kept for 30 seconds
+    /// (a failed lookup for 5), so a stalled resolver can't tie up a thread for every `PASV`
     Dns(String),
 }
 
@@ -62,12 +63,27 @@ pub struct Limits {
     pub max_line: usize,
     /// How many wrong sign-ins a connection may try before it is closed with `421`. Default 3
     pub max_login_attempts: u32,
+    /// How long a connection has to sign in, from the moment it is opened. Commands that need no sign-in (`NOOP`, `FEAT`) don't extend it. The
+    /// connection is closed without a reply. Default 60 seconds. A host that has a deadline of its own can set it longer
+    pub login_timeout: Duration,
+    /// How long a call of the [`Backend`](crate::Backend) (not the upload itself) may take. After it the client gets `450`, or `421` for a sign-in.
+    /// Default 60 seconds
+    pub backend_timeout: Duration,
+    /// The most entries a listing may have. A longer one is refused with `451`: the listing is built in memory. Default 100,000
+    pub max_list_entries: usize,
     /// How long a transfer waits for the client to connect to the passive port. Default 30 seconds
     pub data_accept_timeout: Duration,
     /// How long a TLS handshake may take, on the control connection and on a data connection. Default 30 seconds
     pub tls_handshake_timeout: Duration,
-    /// How long a transfer may stand still, with no byte moved, before it is aborted. Default 60 seconds
+    /// How long a transfer may stand still, with no byte moved, before it is aborted. Default 60 seconds. It is also how long a session that is told
+    /// to end (`QUIT`, or a closed control connection) waits for the transfer that runs
     pub transfer_idle_timeout: Duration,
+    /// The longest a transfer may take in all, whatever it moves: a client that sends a byte every 59 seconds is not standing still. `None`, the
+    /// default, sets no limit
+    pub max_transfer_time: Option<Duration>,
+    /// How long the server waits for the client's `close_notify` after the last byte of a download over TLS, before it closes the connection. Closing
+    /// at once could reset the connection and take the end of the data from the client. Default 3 seconds
+    pub tls_close_wait: Duration,
 }
 
 impl Default for Config {
@@ -91,9 +107,14 @@ impl Default for Limits {
         Limits {
             max_line: 4096,
             max_login_attempts: 3,
+            login_timeout: Duration::from_secs(60),
+            backend_timeout: Duration::from_secs(60),
+            max_list_entries: 100_000,
             data_accept_timeout: Duration::from_secs(30),
-            transfer_idle_timeout: Duration::from_secs(60),
             tls_handshake_timeout: Duration::from_secs(30),
+            transfer_idle_timeout: Duration::from_secs(60),
+            max_transfer_time: None,
+            tls_close_wait: Duration::from_secs(3),
         }
     }
 }

@@ -10,25 +10,6 @@ use thirtyftp::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-struct Random(u64);
-
-impl Random {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
-        items[self.below(items.len())]
-    }
-}
-
 const VERBS: &[&str] = &[
     "USER", "PASS", "ACCT", "QUIT", "NOOP", "SYST", "FEAT", "OPTS", "HELP", "STAT", "PWD", "XPWD", "CWD", "XCWD", "CDUP", "XCUP", "MKD", "XMKD", "RMD", "XRMD",
     "DELE", "RNFR", "RNTO", "TYPE", "MODE", "STRU", "ALLO", "AUTH", "PBSZ", "PROT", "CCC", "PASV", "EPSV", "PORT", "EPRT", "STOR", "APPE", "RETR", "LIST", "NLST",

@@ -72,6 +72,11 @@ pub(crate) fn names(entries: &[Entry]) -> String {
     entries.iter().map(|entry| format!("{}\r\n", safe(&entry.name))).collect()
 }
 
+/// A listing for NLST of a path: the names as they are written to the client, a line for each
+pub(crate) fn lines(names: &[String]) -> String {
+    names.iter().map(|name| format!("{}\r\n", safe(name))).collect()
+}
+
 /// The facts of an entry, `type=file;size=12;modify=20260101000000;`
 fn facts_of(entry: &Entry, facts: Facts) -> String {
     let mut out = String::new();
@@ -137,6 +142,13 @@ mod tests {
             mlsd(&entries(), Facts::default()),
             "type=file;size=1234;modify=20260620125045; a b.pdf\r\ntype=dir;modify=20010909014640; sub\r\ntype=file;size=0; none\r\n"
         );
+    }
+
+    #[test]
+    fn lines_are_the_names_given() {
+        assert_eq!(lines(&["sub/a.txt".to_string(), "sub/b".to_string()]), "sub/a.txt\r\nsub/b\r\n");
+        assert_eq!(lines(&[]), "");
+        assert_eq!(lines(&["a\nb".to_string()]), "a?b\r\n");
     }
 
     #[test]

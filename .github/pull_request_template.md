@@ -1,0 +1,15 @@
+## What changes
+
+<!-- One or two sentences: what is different for the people who use the library. Closes #123 -->
+
+## How it was tested
+
+<!-- The test that fails without the change, and what you tried with a real client -->
+
+## Checklist
+
+- [ ] The title says what changes, in plain words (it becomes the line in the release notes)
+- [ ] One label: `enhancement`, `bug`, `performance`, `documentation`, `dependencies` or `maintenance`
+- [ ] The code is formatted (`cargo fmt`), and `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked` pass
+- [ ] A fix has a test that fails without it
+- [ ] The README tables and the documentation are updated if behaviour changes

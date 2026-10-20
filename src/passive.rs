@@ -2,11 +2,14 @@
 //!
 //! A session has at most one listener, and a data connection is accepted from the client's own address only.
 
+use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::RangeInclusive;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, timeout_at};
 
@@ -21,13 +24,18 @@ pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// How many ports `bind` tries at most: with a range of thousands of ports that are nearly all in use, a failure should be quick (a reply of `425`), not
+/// a hundred milliseconds of system calls on the thread of the runtime
+const MAX_TRIES: u32 = 256;
+
 /// A random number, without a crate for it: the standard library seeds its hash maps from the operating system
 fn random() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
 /// Listens on a port of the range, on the address the control connection came to. The first port tried is a random one, so sessions don't all
-/// go for the same. The range `0..=0` lets the operating system choose.
+/// go for the same. A small range is tried port by port; of a large one, 256 random ports are tried at most. The range `0..=0` lets the operating
+/// system choose.
 pub(crate) async fn bind(ip: IpAddr, ports: &RangeInclusive<u16>) -> io::Result<TcpListener> {
     let (first, last) = (*ports.start(), *ports.end());
     if first > last {
@@ -36,8 +44,10 @@ pub(crate) async fn bind(ip: IpAddr, ports: &RangeInclusive<u16>) -> io::Result<
     let count = u32::from(last - first) + 1;
     let start = (random() % u64::from(count)) as u32;
     let mut last_error = io::Error::from(io::ErrorKind::AddrInUse);
-    for step in 0..count {
-        let port = first + ((start + step) % count) as u16;
+    for step in 0..count.min(MAX_TRIES) {
+        // Every port of a small range once; random ports of a large one
+        let offset = if count <= MAX_TRIES { (start + step) % count } else { (random() % u64::from(count)) as u32 };
+        let port = first + offset as u16;
         match TcpListener::bind(SocketAddr::new(ip, port)).await {
             Ok(listener) => return Ok(listener),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse || error.kind() == io::ErrorKind::PermissionDenied => last_error = error,
@@ -64,6 +74,40 @@ pub(crate) async fn accept_from(listener: &TcpListener, client: IpAddr, deadline
         tracing::warn!(%address, "a data connection from another address was closed");
         drop(stream);
     }
+}
+
+/// How long an answer of the resolver is kept, and a failure
+const DNS_KEEP: Duration = Duration::from_secs(30);
+const DNS_KEEP_FAILURE: Duration = Duration::from_secs(5);
+
+type DnsCache = Mutex<HashMap<String, (std::time::Instant, Option<Ipv4Addr>)>>;
+
+/// The IPv4 address of a name, for `PASV` behind NAT. The answer is kept: a resolver that stalls would otherwise tie up a thread of the blocking pool for
+/// every `PASV` of every session. When a new lookup fails, the last answer that worked is still used
+pub(crate) async fn resolve_ipv4(name: &str) -> Option<Ipv4Addr> {
+    static CACHE: OnceLock<DnsCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let remembered = cache.lock().ok().and_then(|map| map.get(name).copied());
+    if let Some((when, address)) = remembered {
+        let keep = if address.is_some() { DNS_KEEP } else { DNS_KEEP_FAILURE };
+        if when.elapsed() < keep {
+            return address;
+        }
+    }
+    let found = match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((name, 0))).await {
+        Ok(Ok(addresses)) => addresses
+            .filter_map(|address| match address.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+            .next(),
+        _ => None,
+    };
+    let answer = found.or_else(|| remembered.and_then(|(_, address)| address));
+    if let Ok(mut map) = cache.lock() {
+        map.insert(name.to_string(), (std::time::Instant::now(), answer));
+    }
+    answer
 }
 
 /// The text of the `227` reply: `Entering Passive Mode (h1,h2,h3,h4,p1,p2).`
@@ -98,22 +142,52 @@ mod tests {
         assert_eq!(epsv_text(50_000), "Entering Extended Passive Mode (|||50000|).");
     }
 
+    /// Two listeners on ports the system chose, and the range that is exactly those two ports. No fixed port: the ports of the tests would be taken by the
+    /// connections of the other tests that run at the same time
+    async fn two_ports() -> (TcpListener, TcpListener, RangeInclusive<u16>) {
+        for _ in 0..50 {
+            let first = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+            let port = first.local_addr().unwrap().port();
+            // The next port, if it is free
+            if let Some(next) = port.checked_add(1)
+                && let Ok(second) = TcpListener::bind((LOOPBACK, next)).await
+            {
+                return (first, second, port..=next);
+            }
+        }
+        panic!("no two ports in a row were free");
+    }
+
     #[tokio::test]
     async fn bind_takes_a_port_of_the_range() {
-        let listener = bind(LOOPBACK, &(41_000..=41_009)).await.unwrap();
-        assert!((41_000..=41_009).contains(&listener.local_addr().unwrap().port()));
+        let (first, second, range) = two_ports().await;
+        let (a, b) = (first.local_addr().unwrap().port(), second.local_addr().unwrap().port());
+        drop((first, second));
+        let listener = bind(LOOPBACK, &range).await.unwrap();
+        assert!([a, b].contains(&listener.local_addr().unwrap().port()));
     }
 
     #[tokio::test]
     async fn bind_skips_the_ports_in_use_and_fails_when_all_are() {
-        let first = bind(LOOPBACK, &(41_020..=41_021)).await.unwrap();
-        let second = bind(LOOPBACK, &(41_020..=41_021)).await.unwrap();
-        assert_ne!(first.local_addr().unwrap().port(), second.local_addr().unwrap().port());
-        assert!(bind(LOOPBACK, &(41_020..=41_021)).await.is_err());
-        // A port is free again as soon as its listener is dropped
-        let port = first.local_addr().unwrap().port();
+        let (first, second, range) = two_ports().await;
+        let (a, b) = (first.local_addr().unwrap().port(), second.local_addr().unwrap().port());
         drop(first);
-        assert_eq!(bind(LOOPBACK, &(41_020..=41_021)).await.unwrap().local_addr().unwrap().port(), port);
+        // Only the first port is free
+        let taken = bind(LOOPBACK, &range).await.unwrap();
+        assert_eq!(taken.local_addr().unwrap().port(), a);
+        assert!(bind(LOOPBACK, &range).await.is_err());
+        // A port is free again as soon as its listener is dropped
+        drop(taken);
+        drop(second);
+        let again = bind(LOOPBACK, &range).await.unwrap();
+        assert!([a, b].contains(&again.local_addr().unwrap().port()));
+    }
+
+    #[tokio::test]
+    async fn a_name_is_resolved_and_remembered() {
+        assert_eq!(resolve_ipv4("localhost").await, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(resolve_ipv4("localhost").await, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(resolve_ipv4("no-such-name.invalid").await, None);
     }
 
     #[tokio::test]

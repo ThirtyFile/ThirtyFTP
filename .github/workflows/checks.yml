@@ -37,6 +37,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked
+      # The fuzz targets are not built by the tests: an API change must not break them unseen (the fuzzing itself is in fuzz.yml)
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTFLAGS: --cfg fuzzing
+      # What `cargo publish` would send must build by itself
+      - run: cargo package --locked
+        if: matrix.os == 'ubuntu-latest'
 
   # curl, Python's ftplib and lftp, plain and over TLS, against the in-memory example server
   clients:
@@ -65,6 +73,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - run: rustup toolchain install
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny

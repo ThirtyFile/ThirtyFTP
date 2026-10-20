@@ -46,7 +46,7 @@ async fn round_trip(mode: suppaftp::Mode) {
     ftp.mkdir("in").await.unwrap();
     ftp.cwd("in").await.unwrap();
     let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-    let stored = ftp.put_file("scan 1.pdf", &mut futures_lite_cursor(&data)).await.unwrap();
+    let stored = ftp.put_file("scan 1.pdf", &mut std::io::Cursor::new(data.clone())).await.unwrap();
     assert_eq!(stored, data.len() as u64);
     assert_eq!(server.backend.files.lock().unwrap().get("/in/scan 1.pdf"), Some(&data));
     assert_eq!(ftp.size("scan 1.pdf").await.unwrap(), data.len());
@@ -62,27 +62,6 @@ async fn round_trip(mode: suppaftp::Mode) {
     assert!(download(&mut ftp, "missing").await.is_err());
     ftp.noop().await.unwrap();
     ftp.quit().await.unwrap();
-}
-
-fn futures_lite_cursor(data: &[u8]) -> tokio_util_compat::Reader {
-    tokio_util_compat::Reader(std::io::Cursor::new(data.to_vec()))
-}
-
-/// suppaftp reads an upload through the futures `AsyncRead`; this lets a cursor be one
-mod tokio_util_compat {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    pub struct Reader(pub std::io::Cursor<Vec<u8>>);
-
-    impl tokio::io::AsyncRead for Reader {
-        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-            let mut chunk = vec![0u8; buf.remaining()];
-            let read = std::io::Read::read(&mut self.0, &mut chunk)?;
-            buf.put_slice(&chunk[..read]);
-            Poll::Ready(Ok(()))
-        }
-    }
 }
 
 #[tokio::test]

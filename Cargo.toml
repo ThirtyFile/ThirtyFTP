@@ -9,25 +9,23 @@ repository = "https://github.com/ThirtyFile/ThirtyFTP"
 readme = "README.md"
 keywords = ["ftp", "ftps", "server", "tokio", "rustls"]
 categories = ["network-programming"]
-exclude = ["/.github", "/fuzz", "/scripts", "/deny.toml", "/rustfmt.toml", "/rust-toolchain.toml"]
+exclude = ["/.github", "/fuzz", "/scripts", "/deny.toml", "/rustfmt.toml", "/rust-toolchain.toml", "/examples/memory.rs"]
 
 [dependencies]
-async-trait = "0.1"
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 thiserror = "2"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false }
 tracing = "0.1"
 
 [lints.rust]
-unsafe_code = "forbid"
-missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 proptest = "1"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 suppaftp = { version = "12", features = ["tokio-rustls-aws-lc-rs"] }

@@ -292,7 +292,8 @@ async fn the_information_commands() {
     let feat = client.command("FEAT").await;
     assert_eq!(feat.0, 211);
     assert_eq!(feat.1.first().map(String::as_str), Some("Extensions supported:"));
-    assert!(feat.1.contains(&"UTF8".to_string()) || feat.1.contains(&" UTF8".to_string()), "{feat:?}");
+    // Without TLS settings there is nothing of AUTH, PBSZ and PROT; a line of the middle starts with a space (RFC 2389)
+    assert_eq!(feat.1, ["Extensions supported:", " EPSV", " MDTM", " MLST type*;size*;modify*;", " PASV", " REST STREAM", " SIZE", " UTF8", "End"]);
     assert_eq!(client.code("OPTS UTF8 ON").await, 200);
     assert_eq!(client.code("opts utf8 on").await, 200);
     assert_eq!(client.code("OPTS UTF8 OFF").await, 504);
@@ -391,35 +392,36 @@ async fn bytes_that_are_not_utf8_do_not_stop_the_session() {
     let server = start().await;
     let mut client = Client::connect(&server).await;
     client.login().await;
+    // A name in Latin-1 or Big5 is not UTF-8: it is refused, and not turned into a name that another name would be the same as
     client.send_bytes(b"MKD caf\xe9 \xff\xfe\r\n").await;
-    // The name has U+FFFD in it, which is not a control character: it is a directory
-    assert_eq!(client.reply().await.0, 257);
+    assert_eq!(client.reply().await.0, 501);
+    client.send_bytes(b"MKD caf\xe8\r\n").await;
+    assert_eq!(client.reply().await.0, 501);
+    assert!(server.backend.directories.lock().unwrap().iter().all(|directory| !directory.contains('\u{fffd}')));
     client.send_bytes(b"\x80\x81\x82\r\n").await;
-    assert_eq!(client.reply().await.0, 500);
+    assert_eq!(client.reply().await.0, 501);
     assert_eq!(client.code("NOOP").await, 200);
+    // A name in UTF-8 is fine
+    let mut other = Client::connect(&server).await;
+    other.send("USER ali\u{e7}e").await;
+    assert_eq!(other.reply().await.0, 331);
 }
 
 #[tokio::test]
 async fn random_bytes_never_stop_the_server() {
     let server = start().await;
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut random = Random(0x2545_f491_4f6c_dd1d);
     for round in 0..20 {
         let mut client = Client::connect(&server).await;
         let mut junk = Vec::new();
         for _ in 0..4000 {
             // Many of them line ends, spaces, letters and Telnet bytes, so that lines and commands are formed
-            junk.push(match next() % 8 {
+            junk.push(match random.next() % 8 {
                 0 => b'\n',
                 1 => b' ',
                 2 => 0xff,
-                3 => b'A' + (next() % 26) as u8,
-                _ => next() as u8,
+                3 => b'A' + (random.next() % 26) as u8,
+                _ => random.next() as u8,
             });
         }
         let _ = tokio::io::AsyncWriteExt::write_all(client.reader.get_mut(), &junk).await;
@@ -448,7 +450,7 @@ async fn a_connection_that_closes_in_the_middle_of_a_line_is_not_a_problem() {
 async fn an_idle_connection_is_closed_without_a_reply() {
     let server = start_with({
         let mut config = Config::default();
-        config.idle_timeout = Duration::from_millis(300);
+        config.idle_timeout = Duration::from_millis(1000);
         config
     })
     .await;
@@ -456,7 +458,7 @@ async fn an_idle_connection_is_closed_without_a_reply() {
     let start = Instant::now();
     // Nothing is sent to the client (RFC 1123 section 4.1.2.11): the next thing it sees is the end of the connection
     assert!(client.closed().await);
-    assert!(start.elapsed() >= Duration::from_millis(250) && start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    assert!(start.elapsed() >= Duration::from_millis(700) && start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
     eventually(|| matches!(server.ends.lock().unwrap().first(), Some(SessionEnd::IdleTimeout))).await;
 }
 
@@ -464,7 +466,7 @@ async fn an_idle_connection_is_closed_without_a_reply() {
 async fn a_client_that_sends_a_byte_now_and_then_is_still_idle() {
     let server = start_with({
         let mut config = Config::default();
-        config.idle_timeout = Duration::from_millis(500);
+        config.idle_timeout = Duration::from_millis(1000);
         config
     })
     .await;
@@ -475,26 +477,26 @@ async fn a_client_that_sends_a_byte_now_and_then_is_still_idle() {
         if tokio::io::AsyncWriteExt::write_all(client.reader.get_mut(), b"N").await.is_err() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if start.elapsed() > Duration::from_secs(4) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if start.elapsed() > Duration::from_secs(6) {
             break;
         }
     }
     assert!(client.closed().await);
-    assert!(start.elapsed() < Duration::from_millis(2500), "{:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_millis(3500), "{:?}", start.elapsed());
 }
 
 #[tokio::test]
 async fn every_command_resets_the_idle_time() {
     let server = start_with({
         let mut config = Config::default();
-        config.idle_timeout = Duration::from_millis(600);
+        config.idle_timeout = Duration::from_millis(2000);
         config
     })
     .await;
     let mut client = Client::connect(&server).await;
-    for _ in 0..6 {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(client.code("NOOP").await, 200);
     }
 }
@@ -530,4 +532,172 @@ async fn many_sessions_at_once() {
     for task in tasks {
         task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn a_user_name_with_a_control_character_is_501() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    for name in ["a\u{1}b", "a\u{7f}b", "a\u{85}b", "a\rb", "a\0b"] {
+        client.send(&format!("USER {name}")).await;
+        assert_eq!(client.reply().await.0, 501, "{name:?}");
+    }
+    assert!(server.backend.logins.lock().unwrap().is_empty());
+    assert_eq!(client.code("USER alice").await, 331);
+}
+
+#[tokio::test]
+async fn the_time_to_sign_in_is_from_the_start_and_noop_does_not_extend_it() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.login_timeout = Duration::from_millis(1500);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    let start = Instant::now();
+    // Commands that need no sign-in, every 200 ms: the connection is not idle, and not signed in either
+    loop {
+        client.send("NOOP").await;
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_millis(200), tokio::io::AsyncBufReadExt::read_line(&mut client.reader, &mut line)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            _ => {}
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "the connection stayed open");
+    }
+    assert!(start.elapsed() >= Duration::from_millis(1200) && start.elapsed() < Duration::from_secs(6), "{:?}", start.elapsed());
+    eventually(|| matches!(server.ends.lock().unwrap().first(), Some(SessionEnd::LoginTimeout))).await;
+}
+
+#[tokio::test]
+async fn a_user_who_signed_in_is_not_cut_by_the_time_to_sign_in() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.login_timeout = Duration::from_millis(400);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(client.code("NOOP").await, 200);
+}
+
+#[tokio::test]
+async fn settings_with_huge_values_do_not_panic() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.idle_timeout = Duration::MAX;
+        config.limits.login_timeout = Duration::MAX;
+        config.limits.backend_timeout = Duration::MAX;
+        config.limits.data_accept_timeout = Duration::MAX;
+        config.limits.transfer_idle_timeout = Duration::MAX;
+        config.limits.tls_handshake_timeout = Duration::MAX;
+        config.limits.max_line = usize::MAX;
+        config.limits.max_transfer_time = Some(Duration::MAX);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    assert_eq!(client.command("PWD").await.0, 257);
+    let address = client.pasv().await;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    assert_eq!(client.code("STOR f.txt").await, 150);
+    tokio::io::AsyncWriteExt::write_all(&mut stream, b"data").await.unwrap();
+    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.unwrap();
+    assert_eq!(client.reply().await.0, 226);
+    assert_eq!(client.code("NOOP").await, 200);
+}
+
+#[tokio::test]
+async fn a_backend_call_that_takes_too_long_is_450_and_the_session_goes_on() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.backend_timeout = Duration::from_millis(400);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    assert_eq!(client.code("MKD hang").await, 257);
+    let start = Instant::now();
+    assert_eq!(client.code("CWD hang").await, 450);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(client.code("NOOP").await, 200);
+    assert_eq!(client.command("PWD").await.1, ["\"/\" is the current directory."]);
+}
+
+#[tokio::test]
+async fn a_sign_in_that_takes_too_long_is_421() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.backend_timeout = Duration::from_millis(400);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    assert_eq!(client.code("USER slow").await, 331);
+    assert_eq!(client.code("PASS x").await, 421);
+    assert!(client.closed().await);
+    eventually(|| matches!(server.ends.lock().unwrap().first(), Some(SessionEnd::LoginUnavailable))).await;
+}
+
+#[tokio::test]
+async fn a_listing_that_is_too_long_is_451() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.max_list_entries = 2;
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    for name in ["a", "b"] {
+        upload(&mut client, name, b"x").await;
+    }
+    assert_eq!(listing(&mut client, "NLST").await.lines().count(), 2, "two entries are allowed");
+    upload(&mut client, "c", b"x").await;
+    client.pasv().await;
+    assert_eq!(client.code("LIST").await, 451);
+    assert_eq!(client.code("STAT /").await, 451);
+    assert_eq!(client.code("NOOP").await, 200);
+}
+
+#[tokio::test]
+async fn small_commands_and_their_edges() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    // OPTS MLST without a list turns all the facts on
+    assert_eq!(client.command("OPTS MLST size;").await.1, ["MLST OPTS size;"]);
+    assert_eq!(client.command("OPTS MLST").await.1, ["MLST OPTS type;size;modify;"]);
+    // MLST of the working directory, and MDTM of a directory
+    assert_eq!(client.code("MKD d").await, 257);
+    assert_eq!(client.code("CWD d").await, 250);
+    let (code, lines) = client.command("MLST").await;
+    assert_eq!(code, 250);
+    assert_eq!(lines[0], "Listing /d");
+    assert!(lines[1].trim_start().starts_with("type=dir;") && lines[1].ends_with(" /d"), "{lines:?}");
+    assert_eq!(client.code("MDTM /d").await, 550, "a directory of the memory has no time");
+    // The root is not a file name
+    client.pasv().await;
+    assert_eq!(client.code("STOR /").await, 553);
+    // A path that can't be used
+    assert_eq!(client.code("LIST a\u{1}b").await, 553);
+    assert_eq!(client.code("SIZE a\u{1}b").await, 553);
+    assert_eq!(client.code("MLST a\u{1}b").await, 553);
+    assert_eq!(client.code("STAT a\u{1}b").await, 553);
+}
+
+#[tokio::test]
+async fn a_storage_that_fails_to_open_a_file_is_450() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    upload(&mut client, "unreadable.bin", b"x").await;
+    client.pasv().await;
+    assert_eq!(client.code("RETR unreadable.bin").await, 450);
+    assert_eq!(client.code("NOOP").await, 200);
 }

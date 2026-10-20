@@ -7,7 +7,6 @@
 //! knows its users and storage and a [`Config`]:
 //!
 //! ```no_run
-//! use async_trait::async_trait;
 //! use std::sync::Arc;
 //! use thirtyftp::{Backend, Config, Entry, FsError, FtpPath, LoginContext, LoginError, NoEvents, serve};
 //! use tokio::io::{AsyncRead, AsyncReadExt};
@@ -15,7 +14,6 @@
 //! /// Accepts one user, takes uploads and throws them away
 //! struct Sink;
 //!
-//! #[async_trait]
 //! impl Backend for Sink {
 //!     type User = ();
 //!
@@ -82,6 +80,7 @@
 mod active;
 mod ascii;
 mod backend;
+mod clock;
 mod codec;
 mod command;
 mod config;

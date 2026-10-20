@@ -15,7 +15,7 @@ const CHUNK: usize = 8192;
 
 /// Which way the line ends are converted
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Direction {
+pub(crate) enum Conversion {
     /// From the network form to the stored form: CRLF becomes LF (upload)
     FromNetwork,
     /// From the stored form to the network form: LF becomes CRLF (download)
@@ -25,7 +25,7 @@ pub(crate) enum Direction {
 /// Reads from `inner` and delivers the bytes with their line ends converted
 pub(crate) struct Converting<R> {
     inner: R,
-    direction: Direction,
+    direction: Conversion,
     /// Converted bytes not delivered yet
     out: Vec<u8>,
     position: usize,
@@ -36,7 +36,7 @@ pub(crate) struct Converting<R> {
 }
 
 impl<R> Converting<R> {
-    pub(crate) fn new(inner: R, direction: Direction) -> Converting<R> {
+    pub(crate) fn new(inner: R, direction: Conversion) -> Converting<R> {
         Converting { inner, direction, out: Vec::new(), position: 0, scratch: Box::new([0; CHUNK]), after_cr: false, done: false }
     }
 
@@ -46,7 +46,7 @@ impl<R> Converting<R> {
         for index in 0..input_length {
             let byte = self.scratch[index];
             match self.direction {
-                Direction::FromNetwork => {
+                Conversion::FromNetwork => {
                     if self.after_cr {
                         self.after_cr = false;
                         if byte == LF {
@@ -62,7 +62,7 @@ impl<R> Converting<R> {
                         self.out.push(byte);
                     }
                 }
-                Direction::ToNetwork => {
+                Conversion::ToNetwork => {
                     if byte == LF && !self.after_cr {
                         self.out.push(CR);
                     }
@@ -100,7 +100,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for Converting<R> {
                     if length == 0 {
                         this.done = true;
                         // A CR at the very end has no LF after it
-                        if this.direction == Direction::FromNetwork && this.after_cr {
+                        if this.direction == Conversion::FromNetwork && this.after_cr {
                             this.after_cr = false;
                             this.out.push(CR);
                         }
@@ -113,24 +113,26 @@ impl<R: AsyncRead + Unpin> AsyncRead for Converting<R> {
     }
 }
 
+/// Delivers its pieces one by one, so that a conversion (or any reader) sees every kind of split
+#[cfg(test)]
+pub(crate) struct Pieces(pub(crate) std::collections::VecDeque<Vec<u8>>);
+
+#[cfg(test)]
+impl AsyncRead for Pieces {
+    fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if let Some(piece) = self.0.pop_front() {
+            buf.put_slice(&piece);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
-    /// Delivers its pieces one by one, so that the conversion sees every kind of split
-    struct Pieces(std::collections::VecDeque<Vec<u8>>);
-
-    impl AsyncRead for Pieces {
-        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-            if let Some(piece) = self.0.pop_front() {
-                buf.put_slice(&piece);
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    async fn convert(input: &[u8], split: usize, direction: Direction) -> Vec<u8> {
+    async fn convert(input: &[u8], split: usize, direction: Conversion) -> Vec<u8> {
         let (first, second) = input.split_at(split);
         let pieces = [first.to_vec(), second.to_vec()].into_iter().filter(|piece| !piece.is_empty()).collect();
         let mut out = Vec::new();
@@ -138,7 +140,7 @@ mod tests {
         out
     }
 
-    async fn check(input: &[u8], expected: &[u8], direction: Direction) {
+    async fn check(input: &[u8], expected: &[u8], direction: Conversion) {
         for split in 0..=input.len() {
             assert_eq!(convert(input, split, direction).await, expected, "{input:?} split at {split}");
         }
@@ -146,26 +148,26 @@ mod tests {
 
     #[tokio::test]
     async fn crlf_becomes_lf_on_the_way_in() {
-        check(b"a\r\nb\r\n", b"a\nb\n", Direction::FromNetwork).await;
-        check(b"a\nb", b"a\nb", Direction::FromNetwork).await;
-        check(b"", b"", Direction::FromNetwork).await;
-        check(b"\r\n", b"\n", Direction::FromNetwork).await;
-        check(b"\r\r\n", b"\r\n", Direction::FromNetwork).await;
-        check(b"a\rb", b"a\rb", Direction::FromNetwork).await;
-        check(b"a\r", b"a\r", Direction::FromNetwork).await;
-        check(b"\r\n\r\n\r", b"\n\n\r", Direction::FromNetwork).await;
-        check(&[0, 255, b'\r', b'\n', 128], &[0, 255, b'\n', 128], Direction::FromNetwork).await;
+        check(b"a\r\nb\r\n", b"a\nb\n", Conversion::FromNetwork).await;
+        check(b"a\nb", b"a\nb", Conversion::FromNetwork).await;
+        check(b"", b"", Conversion::FromNetwork).await;
+        check(b"\r\n", b"\n", Conversion::FromNetwork).await;
+        check(b"\r\r\n", b"\r\n", Conversion::FromNetwork).await;
+        check(b"a\rb", b"a\rb", Conversion::FromNetwork).await;
+        check(b"a\r", b"a\r", Conversion::FromNetwork).await;
+        check(b"\r\n\r\n\r", b"\n\n\r", Conversion::FromNetwork).await;
+        check(&[0, 255, b'\r', b'\n', 128], &[0, 255, b'\n', 128], Conversion::FromNetwork).await;
     }
 
     #[tokio::test]
     async fn lf_becomes_crlf_on_the_way_out() {
-        check(b"a\nb\n", b"a\r\nb\r\n", Direction::ToNetwork).await;
-        check(b"a\r\nb", b"a\r\nb", Direction::ToNetwork).await;
-        check(b"", b"", Direction::ToNetwork).await;
-        check(b"\n", b"\r\n", Direction::ToNetwork).await;
-        check(b"\n\n", b"\r\n\r\n", Direction::ToNetwork).await;
-        check(b"a\rb", b"a\rb", Direction::ToNetwork).await;
-        check(b"\r\r\n\n", b"\r\r\n\r\n", Direction::ToNetwork).await;
+        check(b"a\nb\n", b"a\r\nb\r\n", Conversion::ToNetwork).await;
+        check(b"a\r\nb", b"a\r\nb", Conversion::ToNetwork).await;
+        check(b"", b"", Conversion::ToNetwork).await;
+        check(b"\n", b"\r\n", Conversion::ToNetwork).await;
+        check(b"\n\n", b"\r\n\r\n", Conversion::ToNetwork).await;
+        check(b"a\rb", b"a\rb", Conversion::ToNetwork).await;
+        check(b"\r\r\n\n", b"\r\r\n\r\n", Conversion::ToNetwork).await;
     }
 
     #[tokio::test]
@@ -173,16 +175,16 @@ mod tests {
         let input: Vec<u8> = (0..100_000).flat_map(|i| if i % 7 == 0 { vec![b'x', LF] } else { vec![b'y'] }).collect();
         let expected: Vec<u8> = input.iter().flat_map(|&b| if b == LF { vec![CR, LF] } else { vec![b] }).collect();
         let mut out = Vec::new();
-        Converting::new(std::io::Cursor::new(input.clone()), Direction::ToNetwork).read_to_end(&mut out).await.unwrap();
+        Converting::new(std::io::Cursor::new(input.clone()), Conversion::ToNetwork).read_to_end(&mut out).await.unwrap();
         assert_eq!(out, expected);
         let mut back = Vec::new();
-        Converting::new(std::io::Cursor::new(out), Direction::FromNetwork).read_to_end(&mut back).await.unwrap();
+        Converting::new(std::io::Cursor::new(out), Conversion::FromNetwork).read_to_end(&mut back).await.unwrap();
         assert_eq!(back, input);
     }
 
     #[tokio::test]
     async fn a_small_buffer_gets_the_rest_later() {
-        let mut converting = Converting::new(std::io::Cursor::new(b"a\nb\nc\n".to_vec()), Direction::ToNetwork);
+        let mut converting = Converting::new(std::io::Cursor::new(b"a\nb\nc\n".to_vec()), Conversion::ToNetwork);
         let mut out = Vec::new();
         let mut one = [0u8; 1];
         while converting.read(&mut one).await.unwrap() == 1 {

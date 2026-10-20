@@ -8,7 +8,6 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-async-trait = "0.1"
 libfuzzer-sys = "0.4"
 thirtyftp = { path = ".." }
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros"] }

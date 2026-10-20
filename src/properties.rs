@@ -1,6 +1,6 @@
 //! Properties that must hold for any input: nothing panics, and what is promised about lines, paths, replies and conversions holds
 
-use crate::ascii::{Converting, Direction};
+use crate::ascii::{Conversion, Converting, Pieces};
 use crate::codec::{Line, LineReader};
 use crate::command::{self, Command};
 use crate::path::FtpPath;
@@ -8,18 +8,6 @@ use crate::reply::Reply;
 use crate::{active, listing};
 use proptest::prelude::*;
 use tokio::io::AsyncReadExt;
-
-/// Delivers its pieces one by one, so that a conversion sees the split
-struct Pieces(std::collections::VecDeque<Vec<u8>>);
-
-impl tokio::io::AsyncRead for Pieces {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(piece) = self.0.pop_front() {
-            buf.put_slice(&piece);
-        }
-        std::task::Poll::Ready(Ok(()))
-    }
-}
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
@@ -168,7 +156,7 @@ proptest! {
 
     #[test]
     fn ascii_conversion_is_the_same_however_the_input_is_split(bytes in prop::collection::vec(prop_oneof![Just(b'\r'), Just(b'\n'), any::<u8>()], 0..200), cut in any::<usize>()) {
-        for direction in [Direction::FromNetwork, Direction::ToNetwork] {
+        for direction in [Conversion::FromNetwork, Conversion::ToNetwork] {
             let whole = block_on(async {
                 let mut out = Vec::new();
                 Converting::new(std::io::Cursor::new(bytes.clone()), direction).read_to_end(&mut out).await.unwrap();
@@ -189,9 +177,9 @@ proptest! {
     fn text_without_a_cr_goes_out_and_back_unchanged(bytes in prop::collection::vec(any::<u8>().prop_filter("no CR", |b| *b != b'\r'), 0..300)) {
         let result = block_on(async {
             let mut network = Vec::new();
-            Converting::new(std::io::Cursor::new(bytes.clone()), Direction::ToNetwork).read_to_end(&mut network).await.unwrap();
+            Converting::new(std::io::Cursor::new(bytes.clone()), Conversion::ToNetwork).read_to_end(&mut network).await.unwrap();
             let mut back = Vec::new();
-            Converting::new(std::io::Cursor::new(network), Direction::FromNetwork).read_to_end(&mut back).await.unwrap();
+            Converting::new(std::io::Cursor::new(network), Conversion::FromNetwork).read_to_end(&mut back).await.unwrap();
             back
         });
         prop_assert_eq!(result, bytes);

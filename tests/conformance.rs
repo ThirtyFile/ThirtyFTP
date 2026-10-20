@@ -8,9 +8,25 @@ fn rust_files(directory: &Path, out: &mut Vec<String>) {
         if path.is_dir() {
             rust_files(&path, out);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
-            out.push(std::fs::read_to_string(&path).unwrap());
+            out.push(std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n"));
         }
     }
+}
+
+/// Whether a file has a test of this name: a function, with the attribute of a test on the line before it, and not ignored
+fn has_test(sources: &[String], name: &str) -> bool {
+    let signature = format!("fn {name}(");
+    sources.iter().any(|source| {
+        let lines: Vec<&str> = source.lines().collect();
+        lines.iter().enumerate().any(|(index, line)| {
+            let declared = line.trim_start().strip_prefix("async ").unwrap_or(line.trim_start()).starts_with(&signature);
+            // The attributes above the function, up to the first line that is not one
+            let attributes: Vec<&str> = lines[..index].iter().rev().map(|line| line.trim()).take_while(|line| line.starts_with("#[")).collect();
+            declared
+                && attributes.iter().any(|attribute| *attribute == "#[test]" || attribute.starts_with("#[tokio::test"))
+                && !attributes.iter().any(|attribute| attribute.starts_with("#[ignore"))
+        })
+    })
 }
 
 #[test]
@@ -19,7 +35,6 @@ fn every_row_of_the_conformance_tables_names_tests_that_exist() {
     let mut sources = Vec::new();
     rust_files(&root.join("src"), &mut sources);
     rust_files(&root.join("tests"), &mut sources);
-    let sources = sources.join("\n");
     let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
 
     let mut rows = 0;
@@ -48,13 +63,25 @@ fn every_row_of_the_conformance_tables_names_tests_that_exist() {
         }
         for name in found {
             names += 1;
-            if !sources.contains(&format!("fn {name}(")) {
+            if !has_test(&sources, name) {
                 missing.push(name.to_string());
             }
         }
     }
     assert!(rows > 30, "the tables were not found: {rows} rows");
     assert!(names > 60, "the test names were not found: {names}");
-    assert!(missing.is_empty(), "tests named in the README that don't exist: {missing:?}");
+    assert!(missing.is_empty(), "tests named in the README that don't exist, or are not tests, or are ignored: {missing:?}");
     assert!(without_tests.is_empty(), "rows without tests that are not marked as not applicable or not provided: {without_tests:?}");
+}
+
+#[test]
+fn the_guard_itself_tells_a_test_from_a_function_that_is_not_one() {
+    let source = "#[tokio::test]\nasync fn real() {}\n\n#[test]\n#[ignore]\nfn ignored() {}\n\nfn plain() {}\n\n#[tokio::test(start_paused = true)]\nasync fn with_arguments() {}\n".to_string();
+    let sources = [source];
+    assert!(has_test(&sources, "real"));
+    assert!(has_test(&sources, "with_arguments"));
+    assert!(!has_test(&sources, "ignored"));
+    assert!(!has_test(&sources, "plain"));
+    assert!(!has_test(&sources, "rea"));
+    assert!(!has_test(&sources, "missing"));
 }

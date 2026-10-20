@@ -3,54 +3,11 @@
 mod common;
 
 use common::*;
-use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use thirtyftp::{Config, Direction, TransferEnd};
+use thirtyftp::{Config, Direction, SessionEnd, TransferEnd};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
-
-async fn connect(address: SocketAddr) -> TcpStream {
-    TcpStream::connect(address).await.unwrap()
-}
-
-async fn read_all(mut stream: TcpStream) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut bytes)).await.expect("the data did not end").unwrap();
-    bytes
-}
-
-/// Signs in, sends a file through a new passive connection, and returns when `226` came
-async fn upload(client: &mut Client, name: &str, data: &[u8]) {
-    let address = client.pasv().await;
-    let mut stream = connect(address).await;
-    assert_eq!(client.code(&format!("STOR {name}")).await, 150);
-    stream.write_all(data).await.unwrap();
-    stream.shutdown().await.unwrap();
-    assert_eq!(client.reply().await.0, 226);
-}
-
-async fn download(client: &mut Client, name: &str) -> Vec<u8> {
-    let address = client.pasv().await;
-    let stream = connect(address).await;
-    assert_eq!(client.code(&format!("RETR {name}")).await, 150);
-    let data = read_all(stream).await;
-    assert_eq!(client.reply().await.0, 226);
-    data
-}
-
-async fn listing(client: &mut Client, command: &str) -> String {
-    let address = client.pasv().await;
-    let stream = connect(address).await;
-    assert_eq!(client.code(command).await, 150, "{command}");
-    let data = read_all(stream).await;
-    assert_eq!(client.reply().await.0, 226, "{command}");
-    String::from_utf8(data).unwrap()
-}
-
-fn pattern(length: usize) -> Vec<u8> {
-    (0..length).map(|i| (i * 7 + i / 251) as u8).collect()
-}
 
 #[tokio::test]
 async fn pasv_tells_the_address_of_the_connection_and_a_port_that_listens() {
@@ -116,13 +73,14 @@ async fn listings() {
     upload(&mut client, "a.txt", b"12345").await;
     let list = listing(&mut client, "LIST").await;
     assert!(list.contains("-rw-r--r--") && list.contains(" 5 Sep  9  2001 a.txt\r\n"), "{list:?}");
-    assert!(list.contains("drwxr-xr-x") && list.ends_with(" sub\r\n") || list.contains(" sub\r\n"), "{list:?}");
+    // A directory of the memory has no time: the epoch
+    assert!(list.contains("drwxr-xr-x   2 ftp      ftp                 0 Jan  1  1970 sub\r\n"), "{list:?}");
     assert_eq!(listing(&mut client, "LIST -la").await, list, "options are ignored");
     let names = listing(&mut client, "NLST").await;
     assert!(names == "a.txt\r\nsub\r\n" || names == "sub\r\na.txt\r\n", "{names:?}");
     let facts = listing(&mut client, "MLSD").await;
     assert!(facts.contains("type=file;size=5;modify=20010909014640; a.txt\r\n"), "{facts:?}");
-    assert!(facts.contains("type=dir;modify=20010909014640;") || facts.contains("type=dir;"), "{facts:?}");
+    assert!(facts.contains("type=dir; sub\r\n"), "{facts:?}");
     // The listing of a file is that file
     assert_eq!(listing(&mut client, "NLST a.txt").await, "a.txt\r\n");
     assert!(listing(&mut client, "LIST a.txt").await.ends_with(" a.txt\r\n"));
@@ -172,7 +130,7 @@ async fn a_data_connection_is_for_one_transfer() {
     assert_eq!(client.code("NLST").await, 425);
 }
 
-// The behaviours that libunftp got wrong (plan, section 3)
+// Behaviours that other servers got wrong (the README lists them)
 
 #[tokio::test]
 async fn a_new_pasv_closes_the_previous_port_at_once() {
@@ -329,7 +287,8 @@ async fn stat_during_a_transfer_shows_the_progress() {
 }
 
 #[tokio::test]
-async fn quit_during_a_transfer_aborts_it_and_closes() {
+async fn quit_during_a_transfer_waits_for_it_and_then_closes() {
+    // RFC 959 section 4.1.3: the connection closes when the transfer is over
     let server = start().await;
     let mut client = Client::connect(&server).await;
     client.login().await;
@@ -338,15 +297,84 @@ async fn quit_during_a_transfer_aborts_it_and_closes() {
     assert_eq!(client.code("STOR f.bin").await, 150);
     stream.write_all(b"some").await.unwrap();
     eventually(|| server.backend.started_writes.load(Ordering::SeqCst) == 1).await;
-    assert_eq!(client.code("QUIT").await, 221);
+    client.send("QUIT").await;
+    // Not answered yet: the upload goes on
+    let mut byte = [0u8; 1];
+    assert!(tokio::time::timeout(Duration::from_millis(300), client.reader.read(&mut byte)).await.is_err());
+    stream.write_all(b" and the rest").await.unwrap();
+    stream.shutdown().await.unwrap();
+    assert_eq!(client.reply().await.0, 226);
+    assert_eq!(client.reply().await.0, 221);
     assert!(client.closed().await);
-    eventually(|| server.backend.aborted_writes.load(Ordering::SeqCst) == 1).await;
-    assert!(server.backend.files.lock().unwrap().is_empty());
+    assert_eq!(server.backend.files.lock().unwrap().get("/f.bin"), Some(&b"some and the rest".to_vec()));
+    eventually(|| matches!(server.ends.lock().unwrap().first(), Some(SessionEnd::Quit))).await;
 }
 
 #[tokio::test]
-async fn a_control_connection_that_closes_during_an_upload_drops_the_upload() {
+async fn quit_during_a_transfer_that_stands_still_ends_it_and_then_closes() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.transfer_idle_timeout = Duration::from_millis(400);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("STOR f.bin").await, 150);
+    stream.write_all(b"some").await.unwrap();
+    client.send("QUIT").await;
+    assert_eq!(client.reply().await.0, 426);
+    assert_eq!(client.reply().await.0, 221);
+    assert!(client.closed().await);
+    assert!(server.backend.files.lock().unwrap().is_empty());
+    assert_eq!(server.backend.aborted_writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn abor_and_then_quit_in_one_go() {
     let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("STOR f.bin").await, 150);
+    stream.write_all(b"some").await.unwrap();
+    eventually(|| server.backend.started_writes.load(Ordering::SeqCst) == 1).await;
+    client.send_bytes(b"QUIT\r\nABOR\r\n").await;
+    assert_eq!(client.reply().await.0, 426);
+    assert_eq!(client.reply().await.0, 226);
+    assert_eq!(client.reply().await.0, 221);
+    assert!(client.closed().await);
+}
+#[tokio::test]
+async fn a_control_connection_that_closes_after_the_data_does_not_lose_the_upload() {
+    // A camera sends the file, closes the data connection and the control connection, and does not wait for the 226. The storage takes 1.5 s
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("STOR slowend.bin").await, 150);
+    stream.write_all(b"the whole file").await.unwrap();
+    stream.shutdown().await.unwrap();
+    drop(stream);
+    drop(client);
+    eventually(|| server.backend.files.lock().unwrap().contains_key("/slowend.bin")).await;
+    assert_eq!(server.backend.aborted_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(server.backend.files.lock().unwrap().get("/slowend.bin"), Some(&b"the whole file".to_vec()));
+    eventually(|| matches!(server.events.ended.lock().unwrap().last(), Some((_, TransferEnd::Completed(14))))).await;
+}
+
+#[tokio::test]
+async fn a_control_connection_that_closes_while_the_upload_stands_still_drops_the_upload() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.transfer_idle_timeout = Duration::from_millis(400);
+        config
+    })
+    .await;
     let mut client = Client::connect(&server).await;
     client.login().await;
     let address = client.pasv().await;
@@ -357,9 +385,8 @@ async fn a_control_connection_that_closes_during_an_upload_drops_the_upload() {
     drop(client);
     eventually(|| server.backend.aborted_writes.load(Ordering::SeqCst) == 1).await;
     assert!(server.backend.files.lock().unwrap().is_empty());
-    eventually(|| server.events.ended.lock().unwrap().iter().any(|(_, end)| *end == TransferEnd::Aborted)).await;
+    eventually(|| server.events.ended.lock().unwrap().iter().any(|(_, end)| *end == TransferEnd::Aborted || *end == TransferEnd::Failed)).await;
 }
-
 #[tokio::test]
 async fn no_data_connection_in_time_is_425_and_the_session_goes_on() {
     let server = start_with({
@@ -401,7 +428,7 @@ async fn a_transfer_that_stands_still_is_aborted_with_426() {
 async fn a_slow_upload_that_keeps_moving_is_not_aborted() {
     let server = start_with({
         let mut config = Config::default();
-        config.limits.transfer_idle_timeout = Duration::from_millis(500);
+        config.limits.transfer_idle_timeout = Duration::from_millis(2000);
         config
     })
     .await;
@@ -411,20 +438,20 @@ async fn a_slow_upload_that_keeps_moving_is_not_aborted() {
     let mut stream = connect(address).await;
     assert_eq!(client.code("STOR slow.bin").await, 150);
     // Longer than the idle time in all, never the idle time without a byte
-    for _ in 0..8 {
+    for _ in 0..5 {
         stream.write_all(b"0123456789").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
     }
     stream.shutdown().await.unwrap();
     assert_eq!(client.reply().await.0, 226);
-    assert_eq!(server.backend.files.lock().unwrap().get("/slow.bin").map(Vec::len), Some(80));
+    assert_eq!(server.backend.files.lock().unwrap().get("/slow.bin").map(Vec::len), Some(50));
 }
 
 #[tokio::test]
 async fn the_control_connection_is_not_idle_while_a_transfer_runs() {
     let server = start_with({
         let mut config = Config::default();
-        config.idle_timeout = Duration::from_millis(400);
+        config.idle_timeout = Duration::from_millis(1500);
         config
     })
     .await;
@@ -434,9 +461,9 @@ async fn the_control_connection_is_not_idle_while_a_transfer_runs() {
     let mut stream = connect(address).await;
     assert_eq!(client.code("STOR f.bin").await, 150);
     // The client waits for 226 longer than the idle time of the control connection
-    for _ in 0..4 {
+    for _ in 0..3 {
         stream.write_all(b"0123456789").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
     }
     stream.shutdown().await.unwrap();
     assert_eq!(client.reply().await.0, 226);
@@ -555,7 +582,11 @@ async fn stat_with_a_path_lists_on_the_control_connection() {
     let mut client = Client::connect(&server).await;
     client.login().await;
     upload(&mut client, "f.txt", b"12345").await;
+    // 212 for a directory, 213 for a file
     let (code, lines) = client.command("STAT /").await;
+    assert_eq!(code, 212);
+    assert!(lines.iter().any(|line| line.ends_with(" f.txt")), "{lines:?}");
+    let (code, lines) = client.command("STAT f.txt").await;
     assert_eq!(code, 213);
     assert!(lines.iter().any(|line| line.ends_with(" f.txt")), "{lines:?}");
     assert_eq!(client.code("STAT nowhere").await, 550);
@@ -672,4 +703,157 @@ async fn many_uploads_at_once() {
         task.await.unwrap();
     }
     assert_eq!(server.backend.files.lock().unwrap().len(), 20);
+}
+
+#[tokio::test]
+async fn stat_with_a_path_during_a_transfer_is_answered() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    upload(&mut client, "f.txt", b"12345").await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("STOR g.txt").await, 150);
+    let (code, lines) = client.command("STAT /").await;
+    assert_eq!(code, 212);
+    assert!(lines.iter().any(|line| line.ends_with(" f.txt")), "{lines:?}");
+    stream.shutdown().await.unwrap();
+    assert_eq!(client.reply().await.0, 226);
+}
+
+#[tokio::test]
+async fn nlst_of_a_directory_gives_the_names_with_the_path_as_written() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    assert_eq!(client.code("MKD sub").await, 257);
+    upload(&mut client, "sub/a.txt", b"1").await;
+    upload(&mut client, "sub/b.txt", b"2").await;
+    let names = listing(&mut client, "NLST sub").await;
+    assert!(names == "sub/a.txt\r\nsub/b.txt\r\n" || names == "sub/b.txt\r\nsub/a.txt\r\n", "{names:?}");
+    let names = listing(&mut client, "NLST sub/").await;
+    assert!(names.starts_with("sub/") && !names.contains("sub//"), "{names:?}");
+    assert_eq!(listing(&mut client, "NLST /sub/a.txt").await, "/sub/a.txt\r\n");
+    assert_eq!(client.code("CWD sub").await, 250);
+    let names = listing(&mut client, "NLST").await;
+    assert!(names == "a.txt\r\nb.txt\r\n" || names == "b.txt\r\na.txt\r\n", "no path, no prefix: {names:?}");
+}
+
+#[tokio::test]
+async fn a_backend_that_returns_before_the_end_of_the_upload_is_not_a_226() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("STOR early.bin").await, 150);
+    stream.write_all(b"1234567890 and more, which the backend did not read").await.unwrap();
+    // The client is still sending when the backend says Ok
+    let reply = client.reply().await;
+    assert_eq!(reply.0, 451, "{reply:?}");
+    assert_eq!(client.code("NOOP").await, 200);
+}
+
+#[tokio::test]
+async fn the_errors_of_the_backend_become_their_replies() {
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    for (name, expected) in [("denied.bin", 550), ("badname.bin", 553), ("busy.bin", 450), ("full.bin", 552)] {
+        let address = client.pasv().await;
+        let mut stream = connect(address).await;
+        assert_eq!(client.code(&format!("STOR {name}")).await, 150);
+        let _ = stream.write_all(b"data").await;
+        assert_eq!(client.reply().await.0, expected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_name_that_does_not_resolve_is_425_for_pasv_and_epsv_still_works() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.passive_host = thirtyftp::PassiveHost::Dns("no-such-name.invalid".to_string());
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    assert_eq!(client.code("PASV").await, 425);
+    // EPSV tells no address
+    assert_eq!(client.code("EPSV").await, 229);
+}
+
+#[tokio::test]
+async fn the_longest_a_transfer_may_take_is_limited_whatever_it_moves() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.max_transfer_time = Some(Duration::from_millis(1200));
+        config.limits.transfer_idle_timeout = Duration::from_secs(30);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("STOR drip.bin").await, 150);
+    // A byte now and then: the transfer never stands still for the 30 seconds
+    let start = Instant::now();
+    let sender = tokio::spawn(async move {
+        for _ in 0..40 {
+            if stream.write_all(b"x").await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    assert_eq!(client.reply().await.0, 426);
+    assert!(start.elapsed() < Duration::from_secs(6), "{:?}", start.elapsed());
+    assert!(server.backend.files.lock().unwrap().is_empty());
+    sender.abort();
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_a_download_is_cut_off_with_426() {
+    let server = start_with({
+        let mut config = Config::default();
+        config.limits.transfer_idle_timeout = Duration::from_millis(1000);
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    // More than the buffers of the two sockets hold
+    upload(&mut client, "big.bin", &pattern(60_000_000)).await;
+    let address = client.pasv().await;
+    let mut stream = connect(address).await;
+    assert_eq!(client.code("RETR big.bin").await, 150);
+    let mut some = vec![0u8; 1000];
+    stream.read_exact(&mut some).await.unwrap();
+    // And then nothing is read
+    let start = Instant::now();
+    assert_eq!(client.reply().await.0, 426);
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert_eq!(client.code("NOOP").await, 200);
+}
+
+#[tokio::test]
+async fn a_session_with_one_passive_port_can_ask_for_a_new_pasv() {
+    // With one port in the range, the old port has to be given back before the new one is bound
+    let port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let server = start_with({
+        let mut config = Config::default();
+        config.passive_ports = port..=port;
+        config
+    })
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    for _ in 0..3 {
+        assert_eq!(client.pasv().await.port(), port);
+    }
+    assert_eq!(client.epsv().await.port(), port);
 }

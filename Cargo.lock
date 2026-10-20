@@ -945,7 +945,6 @@ dependencies = [
 name = "thirtyftp"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "proptest",
  "rcgen",
  "rustls",

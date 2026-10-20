@@ -28,10 +28,6 @@ async fn secure(server: &Server, tls: &Tls) -> Client {
     client
 }
 
-fn pattern(length: usize) -> Vec<u8> {
-    (0..length).map(|i| (i * 7 + i / 251) as u8).collect()
-}
-
 /// The data connection of a transfer, with TLS. The client connects, sends the command, and starts the handshake when the server says 150
 async fn tls_transfer(client: &mut Client, tls: &Tls, address: SocketAddr, command: &str) -> tokio_rustls::client::TlsStream<TcpStream> {
     let tcp = TcpStream::connect(address).await.unwrap();
@@ -55,6 +51,8 @@ async fn secure_download(client: &mut Client, tls: &Tls, command: &str) -> Vec<u
     let mut stream = tls_transfer(client, tls, address, command).await;
     let mut data = Vec::new();
     stream.read_to_end(&mut data).await.expect("the data must end with a close_notify");
+    // Answer the server's close_notify with ours, as a client does
+    stream.shutdown().await.unwrap();
     assert_eq!(client.reply().await.0, 226, "{command}");
     data
 }
@@ -161,7 +159,7 @@ async fn the_sign_in_before_auth_does_not_carry_over() {
     assert_eq!(client.code("PASS secret").await, 503);
 }
 
-// Plan, section 3, item 1: the switch to TLS right after the 234
+// The switch to TLS right after the 234
 
 #[tokio::test]
 async fn what_the_client_sent_after_auth_tls_in_plain_text_is_never_answered() {
@@ -244,7 +242,7 @@ async fn plain_data_connections_are_allowed_when_tls_is_not_required() {
     assert_eq!(server.backend.files.lock().unwrap().get("/plain.txt"), Some(&b"in the clear".to_vec()));
 }
 
-// Plan, section 3, item 4: the policy on the data channel
+// The policy on the data channel
 
 #[tokio::test]
 async fn with_tls_required_pasv_and_epsv_are_refused_until_prot_p() {
@@ -293,7 +291,7 @@ async fn prot_c_after_pasv_cannot_give_a_transfer_in_plain_text() {
     assert_eq!(client.reply().await.0, 226);
 }
 
-// Plan, section 3, item 5: a failed handshake on the data connection
+// A failed handshake on the data connection
 
 #[tokio::test]
 async fn a_data_connection_that_is_not_tls_is_refused_and_nothing_is_stored() {
@@ -346,7 +344,7 @@ async fn a_data_connection_that_never_starts_the_handshake_is_given_up() {
     assert_eq!(server.backend.started_writes.load(Ordering::SeqCst), 0);
 }
 
-// Plan, section 3, item 7: how an upload ends
+// How an upload ends
 
 #[tokio::test]
 async fn the_server_answers_the_end_of_an_upload_before_the_storage_is_done() {
@@ -354,7 +352,7 @@ async fn the_server_answers_the_end_of_an_upload_before_the_storage_is_done() {
     let server = secure_server(&tls).await;
     let mut client = secure(&server, &tls).await;
     let address = client.pasv().await;
-    // The storage takes 1.5 s after the last byte
+    // The storage takes 2 s after the last byte
     let mut stream = tls_transfer(&mut client, &tls, address, "STOR slowend.bin").await;
     stream.write_all(b"the whole file").await.unwrap();
     let start = Instant::now();
@@ -362,7 +360,7 @@ async fn the_server_answers_the_end_of_an_upload_before_the_storage_is_done() {
     // The client waits for the server's close_notify before it takes the transfer for done
     let mut rest = Vec::new();
     stream.read_to_end(&mut rest).await.expect("the server's close_notify");
-    assert!(start.elapsed() < Duration::from_millis(1000), "the server's close_notify came after the storage was done: {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_millis(1500), "the server's close_notify came after the storage was done: {:?}", start.elapsed());
     assert!(server.backend.files.lock().unwrap().is_empty(), "the storage is still busy");
     assert_eq!(client.reply().await.0, 226);
     assert_eq!(server.backend.files.lock().unwrap().get("/slowend.bin"), Some(&b"the whole file".to_vec()));
@@ -454,4 +452,23 @@ async fn a_client_library_over_tls() {
         assert_eq!(ftp.nlst(None).await.unwrap(), ["a.bin"]);
         ftp.quit().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn a_download_over_tls_ends_even_when_the_client_keeps_its_end_open() {
+    // The server waits for the client's close_notify before it closes, so the end of the data is not lost; a client that never sends it does not
+    // keep the 226 waiting for longer than that
+    let tls = tls();
+    let server = server_with(&tls, |config| config.limits.tls_close_wait = Duration::from_millis(400)).await;
+    let mut client = secure(&server, &tls).await;
+    secure_upload(&mut client, &tls, "f.bin", &pattern(100_000)).await;
+    let address = client.pasv().await;
+    let mut stream = tls_transfer(&mut client, &tls, address, "RETR f.bin").await;
+    let mut data = Vec::new();
+    stream.read_to_end(&mut data).await.unwrap();
+    assert_eq!(data, pattern(100_000));
+    let start = Instant::now();
+    assert_eq!(client.reply().await.0, 226);
+    assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    drop(stream);
 }

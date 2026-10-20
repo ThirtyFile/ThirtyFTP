@@ -5,7 +5,7 @@
 //! removes every Telnet command and keeps the text; `IAC IAC` is one byte 255. It answers none of them (an FTP server may refuse every option).
 //!
 //! A line longer than the limit is dropped, and the reader tells so once it reaches the end of that line, so the next line is read as usual.
-//! Text that isn't UTF-8 is read lossily: the bytes that aren't UTF-8 become U+FFFD.
+//! A line that isn't UTF-8 is not used either (RFC 2640): turning its bytes into U+FFFD would make different names, and different passwords, the same.
 
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -26,6 +26,8 @@ pub(crate) enum Line {
     Text(String),
     /// A line longer than the limit, which has been dropped
     TooLong,
+    /// A line that is not UTF-8, which has been dropped
+    Invalid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +78,6 @@ impl LineReader {
     }
 
     /// Drops what was read and not used. A switch to TLS does this: bytes the client sent in plaintext before the upgrade are never used (RFC 4217)
-    #[allow(dead_code)] // The TLS upgrade (a later milestone)
     pub(crate) fn discard_buffered(&mut self) {
         self.position = 0;
         self.length = 0;
@@ -135,10 +136,16 @@ impl LineReader {
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Some(if too_long || line.len() > self.max_line { Line::TooLong } else { Line::Text(String::from_utf8_lossy(&line).into_owned()) });
+            if too_long || line.len() > self.max_line {
+                return Some(Line::TooLong);
+            }
+            return Some(match String::from_utf8(line) {
+                Ok(text) => Line::Text(text),
+                Err(_) => Line::Invalid,
+            });
         }
         // The CR of the line end is kept until the LF shows that it was one, so the limit allows it
-        if self.line.len() < self.max_line + 1 {
+        if self.line.len() <= self.max_line {
             self.line.push(byte);
         } else {
             self.too_long = true;
@@ -210,8 +217,8 @@ mod tests {
 
     #[tokio::test]
     async fn iac_iac_is_the_byte_255() {
-        // 255 isn't UTF-8 by itself, so it is read as U+FFFD
-        assert_eq!(lines(&[b"A\xff\xffB\r\n"], 100).await, [text("A\u{fffd}B")]);
+        // 255 isn't UTF-8 by itself, so the line is not used
+        assert_eq!(lines(&[b"A\xff\xffB\r\nNOOP\r\n"], 100).await, [Line::Invalid, text("NOOP")]);
     }
 
     #[tokio::test]
@@ -254,8 +261,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bytes_that_are_not_utf8_are_read_lossily() {
-        assert_eq!(lines(&[b"CWD \xe6\x96\xb0\xe6\x96\r\n"], 100).await, [text("CWD \u{65b0}\u{fffd}")]);
+    async fn a_line_that_is_not_utf8_is_not_used_and_the_next_is_read() {
+        assert_eq!(lines(&[b"CWD \xe6\x96\xb0\xe6\x96\r\nNOOP\r\n"], 100).await, [Line::Invalid, text("NOOP")]);
+        assert_eq!(lines(&[b"CWD \xe6\x96\xb0\r\n"], 100).await, [text("CWD \u{65b0}")], "UTF-8 is used");
+        // Two Latin-1 or Big5 names that differ must not become the same name
+        assert_eq!(lines(&[b"STOR caf\xe9\r\nSTOR caf\xe8\r\n"], 100).await, [Line::Invalid, Line::Invalid]);
     }
 
     #[tokio::test]
