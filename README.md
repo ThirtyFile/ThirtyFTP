@@ -124,9 +124,12 @@ These are mistakes that other servers made. Each has a test that fails when the 
 
 ## Tested with
 
-The tests run against [suppaftp](https://crates.io/crates/suppaftp) (plain FTP and FTPS, passive and extended passive mode), and by hand, with
-`curl` (`ftp://` and `--ssl-reqd`) and Python's `ftplib` (`FTP` and `FTP_TLS`). Not tested yet: lftp, FileZilla, Windows Explorer and real scanners and
-cameras.
+The tests run against [suppaftp](https://crates.io/crates/suppaftp) (plain FTP and FTPS, passive and extended passive mode). `scripts/interop.sh`
+runs `curl` (`ftp://` and `--ssl-reqd`), Python's `ftplib` (`FTP` and `FTP_TLS`) and `lftp` (plain and with TLS) against the example server: it passes
+on Linux (lftp 4.9 in Debian bookworm) and on Windows without lftp. Not tested yet: FileZilla, Windows Explorer and real scanners and cameras.
+
+The four fuzz targets ran for 60 seconds each (about 7.9 million inputs for the parser, 1.2 million for the codec, 2.4 million for paths and 70
+thousand whole sessions) without a crash or a hang.
 
 ## Development
 
