@@ -29,7 +29,7 @@ pub(crate) enum TypeArg {
 
 /// A command, with its argument
 #[derive(Debug, Clone, PartialEq, Eq)]
-// The commands for transfers are parsed in full, and answered from the milestone that adds them
+// The commands that are refused (RMD, DELE, RNFR, RNTO, APPE, PORT, EPRT, SITE) are parsed with their arguments, which nothing reads
 #[allow(dead_code)]
 pub(crate) enum Command {
     User(String),

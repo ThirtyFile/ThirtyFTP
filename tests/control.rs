@@ -296,7 +296,8 @@ async fn the_information_commands() {
     assert_eq!(client.code("OPTS UTF8 ON").await, 200);
     assert_eq!(client.code("opts utf8 on").await, 200);
     assert_eq!(client.code("OPTS UTF8 OFF").await, 504);
-    assert_eq!(client.code("OPTS MLST type;").await, 501);
+    assert_eq!(client.code("OPTS MLST type;").await, 200);
+    assert_eq!(client.code("OPTS NOTHING x").await, 501);
     assert_eq!(client.code("OPTS").await, 501);
     let help = client.command("HELP").await;
     assert_eq!(help.0, 214);

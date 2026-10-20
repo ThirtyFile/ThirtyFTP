@@ -5,9 +5,10 @@
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use thirtyftp::{Backend, Config, Entry, Events, FsError, FtpPath, LoginContext, LoginError, SessionEnd, serve};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use thirtyftp::{Backend, Config, Entry, Events, FsError, FtpPath, LoginContext, LoginError, SessionEnd, TransferEnd, TransferInfo, serve};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -20,6 +21,28 @@ pub struct Memory {
     pub logins: Mutex<Vec<(LoginContext, String)>>,
     /// Make `login` say the user store is down
     pub down: Mutex<bool>,
+    /// How many uploads began, and how many of them did not complete (the future was dropped, or the data failed)
+    pub started_writes: AtomicUsize,
+    pub aborted_writes: AtomicUsize,
+}
+
+/// The time every file of the memory was last changed: 2001-09-09 01:46:40 UTC
+pub fn modified() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+}
+
+/// Counts an upload as aborted when it is dropped before it is done
+struct WriteGuard<'a> {
+    done: bool,
+    aborted: &'a AtomicUsize,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Memory {
@@ -53,13 +76,16 @@ impl Backend for Memory {
             return Ok(Entry::directory(name, None));
         }
         match self.files.lock().unwrap().get(&key) {
-            Some(data) => Ok(Entry::file(name, data.len() as u64, None)),
+            Some(data) => Ok(Entry::file(name, data.len() as u64, Some(modified()))),
             None => Err(FsError::NotFound),
         }
     }
 
     async fn list(&self, _: &String, path: &FtpPath) -> Result<Vec<Entry>, FsError> {
         let key = path.to_string();
+        if self.files.lock().unwrap().contains_key(&key) {
+            return Err(FsError::WrongType);
+        }
         if !self.directories.lock().unwrap().contains(&key) {
             return Err(FsError::NotFound);
         }
@@ -71,7 +97,7 @@ impl Backend for Memory {
         }
         for (file, data) in self.files.lock().unwrap().iter() {
             if FtpPath::resolve(&FtpPath::root(), file).unwrap().parent() == *path {
-                entries.push(Entry::file(file.rsplit('/').next().unwrap(), data.len() as u64, None));
+                entries.push(Entry::file(file.rsplit('/').next().unwrap(), data.len() as u64, Some(modified())));
             }
         }
         Ok(entries)
@@ -85,10 +111,19 @@ impl Backend for Memory {
     }
 
     async fn write(&self, _: &String, path: &FtpPath, data: &mut (dyn AsyncRead + Send + Unpin)) -> Result<u64, FsError> {
+        match path.file_name() {
+            Some("full.bin") => return Err(FsError::QuotaExceeded),
+            Some("panic.bin") => panic!("the backend panics"),
+            _ => {}
+        }
+        self.started_writes.fetch_add(1, Ordering::SeqCst);
+        let mut guard = WriteGuard { done: false, aborted: &self.aborted_writes };
         let mut bytes = Vec::new();
         data.read_to_end(&mut bytes).await.map_err(|e| FsError::Local(e.to_string()))?;
         let length = bytes.len() as u64;
+        // Stored only when the data came to its end
         self.files.lock().unwrap().insert(path.to_string(), bytes);
+        guard.done = true;
         Ok(length)
     }
 
@@ -113,6 +148,8 @@ impl Backend for Memory {
 pub struct Recorder {
     pub signed_in: Mutex<Vec<String>>,
     pub failed: Mutex<Vec<String>>,
+    pub started: Mutex<Vec<TransferInfo>>,
+    pub ended: Mutex<Vec<(TransferInfo, TransferEnd)>>,
 }
 
 impl Events for Recorder {
@@ -122,6 +159,14 @@ impl Events for Recorder {
 
     fn login_failed(&self, _: SocketAddr, user: &str) {
         self.failed.lock().unwrap().push(user.to_string());
+    }
+
+    fn transfer_started(&self, _: SocketAddr, _: &str, transfer: &TransferInfo) {
+        self.started.lock().unwrap().push(transfer.clone());
+    }
+
+    fn transfer_ended(&self, _: SocketAddr, _: &str, transfer: &TransferInfo, end: &TransferEnd) {
+        self.ended.lock().unwrap().push((transfer.clone(), end.clone()));
     }
 }
 
@@ -242,6 +287,26 @@ impl Client {
     pub async fn login(&mut self) {
         assert_eq!(self.code("USER alice").await, 331);
         assert_eq!(self.code("PASS secret").await, 230);
+    }
+
+    /// PASV: the address to connect the data connection to
+    pub async fn pasv(&mut self) -> SocketAddr {
+        let (code, lines) = self.command("PASV").await;
+        assert_eq!(code, 227, "{lines:?}");
+        let start = lines[0].find('(').unwrap() + 1;
+        let end = lines[0].find(')').unwrap();
+        let numbers: Vec<u16> = lines[0][start..end].split(',').map(|n| n.parse().unwrap()).collect();
+        assert_eq!(numbers.len(), 6, "{lines:?}");
+        SocketAddr::from(([numbers[0] as u8, numbers[1] as u8, numbers[2] as u8, numbers[3] as u8], numbers[4] * 256 + numbers[5]))
+    }
+
+    /// EPSV: the address to connect the data connection to (the address of the control connection, and the port of the reply)
+    pub async fn epsv(&mut self) -> SocketAddr {
+        let (code, lines) = self.command("EPSV").await;
+        assert_eq!(code, 229, "{lines:?}");
+        let start = lines[0].find("(|||").unwrap() + 4;
+        let end = lines[0].find("|)").unwrap();
+        SocketAddr::new(self.reader.get_ref().peer_addr().unwrap().ip(), lines[0][start..end].parse().unwrap())
     }
 
     /// Whether the server has closed the connection (nothing more to read)

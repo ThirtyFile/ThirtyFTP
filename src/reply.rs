@@ -17,6 +17,7 @@ pub(crate) mod text {
     pub(crate) const COMMAND_OK: &str = "Command okay.";
     pub(crate) const SUPERFLUOUS: &str = "Command not implemented, superfluous at this site.";
     pub(crate) const HELP: &str = "Help message.";
+    pub(crate) const DATA_CLOSED: &str = "Closing data connection. Requested file action successful (for example, file transfer or file abort).";
     pub(crate) const READY: &str = "Service ready for new user.";
     pub(crate) const CLOSING: &str = "Service closing control connection.";
     pub(crate) const LOGGED_IN: &str = "User logged in, proceed.";
