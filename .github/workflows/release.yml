@@ -1,8 +1,8 @@
 # Makes a release, started by hand: Actions > Release > Run workflow, with the version number (the one in Cargo.toml).
-# Runs the checks on main (checks.yml), packages the crate, publishes it on crates.io by itself, and then makes the GitHub release, which creates the tag
+# Scans main with CodeQL (codeql.yml; it stops on open alerts of high or critical severity), runs the checks on main (checks.yml), packages the crate, publishes it on crates.io by itself, and then makes the GitHub release, which creates the tag
 # v1.2.3 on the commit that was checked. The token is the secret CARGO_REGISTRY_TOKEN of the environment "crates-io", which only main can use.
 # A crate cannot be taken back from crates.io, only yanked: start the workflow when the version is meant to be published.
-# Nothing is published or tagged if the checks or the package fail. When a later step fails, run the workflow again with the same version: a crate that
+# Nothing is published or tagged if the scan, the checks or the package fail. When a later step fails, run the workflow again with the same version: a crate that
 # is on crates.io already is not published again, and the release is made from the same commit of main as long as nothing was tagged.
 #
 # Pre-releases (1.2.3-rc.1, anything with a "-") are published on crates.io too (cargo and Cargo.lock ignore them unless asked for) and marked as
@@ -88,6 +88,14 @@ jobs:
             echo "sha=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
+  codeql:
+    name: CodeQL
+    needs: prepare
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+
   checks:
     name: Checks
     needs: prepare
@@ -95,7 +103,7 @@ jobs:
 
   package:
     name: Package
-    needs: [prepare, checks]
+    needs: [prepare, codeql, checks]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
