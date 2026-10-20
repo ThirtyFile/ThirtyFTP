@@ -923,6 +923,7 @@ impl<B: Backend> Session<B> {
             idle_timeout: self.config.limits.transfer_idle_timeout,
             tls: if self.data_private { self.data_tls.clone() } else { None },
             handshake_timeout: self.config.limits.tls_handshake_timeout,
+            ascii: self.ascii && self.config.ascii_conversion,
             progress: progress.clone(),
             events: sender,
         };

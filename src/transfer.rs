@@ -6,6 +6,7 @@
 //! Aborting the task drops everything it holds, including the backend's `write`, which is how an upload that did not complete is discarded.
 
 use crate::active;
+use crate::ascii::{Converting, Direction};
 use crate::backend::{Backend, FsError};
 use crate::passive;
 use crate::path::FtpPath;
@@ -75,6 +76,8 @@ pub(crate) struct Job<B: Backend> {
     /// The TLS settings of the data connection when its protection level is `P`
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) handshake_timeout: Duration,
+    /// Convert the line ends (`TYPE A` with the conversion on)
+    pub(crate) ascii: bool,
     /// The bytes moved so far, for STAT
     pub(crate) progress: Arc<AtomicU64>,
     pub(crate) events: mpsc::Sender<Event>,
@@ -116,7 +119,8 @@ async fn transfer<B: Backend>(job: Job<B>, work: Work) -> Result<u64, Failure> {
         return Err(Failure::Tls);
     }
     match work {
-        Work::Upload(path) => upload(&*job.backend, &*job.user, &path, stream, job.idle_timeout, job.progress).await,
+        Work::Upload(path) => upload(&*job.backend, &*job.user, &path, stream, job.idle_timeout, job.progress, job.ascii).await,
+        Work::Download(reader) if job.ascii => send(Converting::new(reader, Direction::ToNetwork), stream, job.idle_timeout, job.progress).await,
         Work::Download(reader) => send(reader, stream, job.idle_timeout, job.progress).await,
         Work::Listing(text) => send(std::io::Cursor::new(text), stream, job.idle_timeout, job.progress).await,
     }
@@ -126,11 +130,24 @@ async fn transfer<B: Backend>(job: Job<B>, work: Work) -> Result<u64, Failure> {
 ///
 /// Over TLS the end of the data is the client's `close_notify`. A connection that ends without it was cut short, and the upload is not complete
 /// (RFC 8446 section 6.1): the read fails, and `226` is never sent for it
-async fn upload<B: Backend>(backend: &B, user: &B::User, path: &FtpPath, stream: Stream, idle: Duration, progress: Arc<AtomicU64>) -> Result<u64, Failure> {
+async fn upload<B: Backend>(
+    backend: &B,
+    user: &B::User,
+    path: &FtpPath,
+    stream: Stream,
+    idle: Duration,
+    progress: Arc<AtomicU64>,
+    ascii: bool,
+) -> Result<u64, Failure> {
     let failed = Arc::new(AtomicBool::new(false));
     let close_on_eof = stream.is_encrypted();
     let mut reader = IdleRead { inner: stream, idle, sleep: Box::pin(tokio::time::sleep(idle)), progress, failed: failed.clone(), close_on_eof, closed: false };
-    let stored = backend.write(user, path, &mut reader).await;
+    let stored = if ascii {
+        let mut converting = Converting::new(&mut reader, Direction::FromNetwork);
+        backend.write(user, path, &mut converting).await
+    } else {
+        backend.write(user, path, &mut reader).await
+    };
     // A connection that failed or stood still is an upload that did not complete, whatever the backend made of it
     if failed.load(Ordering::Relaxed) {
         return Err(Failure::Aborted);

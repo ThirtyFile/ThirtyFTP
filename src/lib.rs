@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 mod active;
+mod ascii;
 mod backend;
 mod codec;
 mod command;
