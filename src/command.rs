@@ -200,7 +200,7 @@ pub(crate) fn parse(line: &str) -> Result<Command, ParseError> {
     let command = match verb.as_str() {
         "USER" => Command::User(required(rest)?),
         // A password may be empty (some devices send none) and may hold spaces
-        "PASS" => Command::Pass(Secret(rest.unwrap_or("").to_string())),
+        "PASS" => Command::Pass(Secret(rest.map(str::to_string).unwrap_or_default())),
         "ACCT" => {
             required(rest)?;
             Command::Acct
