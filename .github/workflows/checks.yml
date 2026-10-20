@@ -42,9 +42,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         env:
           RUSTFLAGS: --cfg fuzzing
-      # What `cargo publish` would send must build by itself
+      # What `cargo publish` would send must build by itself. In a folder of its own: the build cache is saved from `target`, and the unpacked
+      # crate in it makes the cache step fail to read the folder
       - run: cargo package --locked
         if: matrix.os == 'ubuntu-latest'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/package
 
   # curl, Python's ftplib and lftp, plain and over TLS, against the in-memory example server
   clients:
