@@ -97,3 +97,19 @@ impl Default for Limits {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_defaults_follow_rfc_1123() {
+        let config = Config::default();
+        // Section 4.1.3.2: the idle time is configurable and by default at least 5 minutes
+        assert!(config.idle_timeout >= Duration::from_secs(300));
+        // Active mode is off, TLS is not required without settings for it, and the bytes of an ASCII transfer are not changed
+        assert!(!config.active_mode && !config.require_tls && !config.ascii_conversion && config.tls.is_none());
+        assert_eq!(config.passive_ports, 49152..=65535);
+        assert_eq!(config.passive_host, PassiveHost::FromConnection);
+    }
+}

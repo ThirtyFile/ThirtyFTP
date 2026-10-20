@@ -1,4 +1,5 @@
-# The pull-request gate: formatting, clippy with warnings as errors and the tests, on Linux and Windows.
+# The pull-request gate: formatting, clippy with warnings as errors, the documentation, and the tests on Linux and Windows; real FTP clients against the
+# example server on Linux; and the dependencies (cargo deny).
 name: Checks
 
 on:
@@ -32,12 +33,47 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --locked
+
+  # curl, Python's ftplib and lftp, plain and over TLS, against the in-memory example server
+  clients:
+    name: Real clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: sudo apt-get update && sudo apt-get install -y lftp
+      - run: bash scripts/interop.sh
+        env:
+          INTEROP_REQUIRE_LFTP: "1"
+
+  # Known security problems in the dependencies, their licences and where they come from (deny.toml)
+  deny:
+    name: Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
 
   passed:
     name: Checks passed
     if: always()
-    needs: check
+    needs: [check, clients, deny]
     runs-on: ubuntu-latest
     steps:
-      - run: test "${{ needs.check.result }}" = success
+      - run: test "${{ needs.check.result }}" = success && test "${{ needs.clients.result }}" = success && test "${{ needs.deny.result }}" = success

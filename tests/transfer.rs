@@ -457,6 +457,24 @@ async fn a_storage_error_after_150_is_the_final_reply() {
 }
 
 #[tokio::test]
+async fn what_may_work_later_is_4xx_and_what_will_not_is_5xx() {
+    // RFC 1123 section 4.1.2.11
+    let server = start().await;
+    let mut client = Client::connect(&server).await;
+    client.login().await;
+    for (name, expected) in [("busy.bin", 450), ("full.bin", 552)] {
+        let address = client.pasv().await;
+        let mut stream = connect(address).await;
+        assert_eq!(client.code(&format!("STOR {name}")).await, 150);
+        let _ = stream.write_all(b"data").await;
+        assert_eq!(client.reply().await.0, expected, "{name}");
+    }
+    client.pasv().await;
+    assert_eq!(client.code("RETR nowhere").await, 550);
+    assert_eq!(client.code("MKD /nowhere/x").await, 550);
+}
+
+#[tokio::test]
 async fn a_backend_that_panics_does_not_stop_the_session() {
     let server = start().await;
     let mut client = Client::connect(&server).await;

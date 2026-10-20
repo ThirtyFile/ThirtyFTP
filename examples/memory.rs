@@ -1,4 +1,4 @@
-//! A server on 127.0.0.1:2121 that keeps everything in memory. User `alice`, password `secret`.
+//! A server on 127.0.0.1:2121 (or the port in the environment variable `PORT`) that keeps everything in memory. User `alice`, password `secret`.
 //!
 //! ```sh
 //! cargo run --example memory
@@ -21,7 +21,8 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:2121").await?;
+    let port = std::env::var("PORT").unwrap_or_else(|_| "2121".to_string());
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     println!("Listening on {}", listener.local_addr()?);
     let backend = common::Memory::new();
     let mut config = Config::default();

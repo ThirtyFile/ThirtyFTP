@@ -1,0 +1,28 @@
+# cargo deny check: known security problems, licences, and where crates come from.
+
+[advisories]
+# RustSec advisories, including crates marked unmaintained or unsound; yanked versions fail too
+yanked = "deny"
+
+[licenses]
+# Permissive licences only: ThirtyFTP is Apache-2.0 and is built into other programs with its dependencies
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

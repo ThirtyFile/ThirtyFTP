@@ -1,9 +1,74 @@
 //! ThirtyFTP: a small FTP and FTPS server library for receive folders.
 //!
-//! It serves passive-mode FTP and explicit FTPS (`AUTH TLS`) with uploads, optional listing and downloads, and folder
-//! creation. Active mode, deleting, renaming and implicit FTPS are not supported.
+//! It serves passive-mode FTP and explicit FTPS (`AUTH TLS`) with uploads, optional listing and downloads, and folder creation. Active mode is an
+//! option that is off by default. Deleting, renaming, `SITE` and implicit FTPS are not supported.
 //!
-//! The host accepts the TCP connections and calls [`serve`] for each one, with a [`Backend`] that knows its users and storage.
+//! The host accepts the TCP connections, decides who may connect and how many may at once, and calls [`serve`] for each one, with a [`Backend`] that
+//! knows its users and storage and a [`Config`]:
+//!
+//! ```no_run
+//! use async_trait::async_trait;
+//! use std::sync::Arc;
+//! use thirtyftp::{Backend, Config, Entry, FsError, FtpPath, LoginContext, LoginError, NoEvents, serve};
+//! use tokio::io::{AsyncRead, AsyncReadExt};
+//!
+//! /// Accepts one user, takes uploads and throws them away
+//! struct Sink;
+//!
+//! #[async_trait]
+//! impl Backend for Sink {
+//!     type User = ();
+//!
+//!     async fn login(&self, _: &LoginContext, user: &str, password: &str) -> Result<(), LoginError> {
+//!         if user == "device" && password == "secret" { Ok(()) } else { Err(LoginError::Incorrect) }
+//!     }
+//!     async fn metadata(&self, _: &(), _: &FtpPath) -> Result<Entry, FsError> {
+//!         Err(FsError::PermissionDenied)
+//!     }
+//!     async fn list(&self, _: &(), _: &FtpPath) -> Result<Vec<Entry>, FsError> {
+//!         Err(FsError::PermissionDenied)
+//!     }
+//!     async fn read(&self, _: &(), _: &FtpPath, _: u64) -> Result<Box<dyn AsyncRead + Send + Unpin>, FsError> {
+//!         Err(FsError::PermissionDenied)
+//!     }
+//!     async fn write(&self, _: &(), _: &FtpPath, data: &mut (dyn AsyncRead + Send + Unpin)) -> Result<u64, FsError> {
+//!         let mut bytes = Vec::new();
+//!         data.read_to_end(&mut bytes).await.map_err(|error| FsError::Local(error.to_string()))?;
+//!         Ok(bytes.len() as u64)
+//!     }
+//!     async fn make_dir(&self, _: &(), _: &FtpPath) -> Result<(), FsError> {
+//!         Err(FsError::PermissionDenied)
+//!     }
+//!     async fn change_dir(&self, _: &(), _: &FtpPath) -> Result<(), FsError> {
+//!         Ok(())
+//!     }
+//! }
+//!
+//! # async fn run() -> std::io::Result<()> {
+//! let listener = tokio::net::TcpListener::bind("0.0.0.0:2121").await?;
+//! let config = Arc::new(Config::default());
+//! let backend = Arc::new(Sink);
+//! loop {
+//!     let (stream, peer) = listener.accept().await?;
+//!     tokio::spawn(serve(stream, peer, config.clone(), backend.clone(), Arc::new(NoEvents)));
+//! }
+//! # }
+//! ```
+//!
+//! `examples/receive_folder.rs` is a complete receive folder that stores uploads on disk.
+//!
+//! # The contract of an upload
+//!
+//! [`Backend::write`] is given the data of the upload as a reader, and stores it. When the future is dropped before it is done, or the reader fails,
+//! the upload did not complete (the client aborted it, the connection was cut, the session was dropped): the backend must not keep a partial file, and
+//! must keep the file that was there before. Over TLS a connection that ends without a `close_notify` is such a cut: the reader fails, and the client is
+//! never told that the upload succeeded.
+//!
+//! # Specifications
+//!
+//! RFC 959 and RFC 1123 section 4.1 are the base; the README has the table that says, for each requirement, what is done. RFC 2228 and 4217 (FTPS),
+//! RFC 2428 (EPSV and EPRT), RFC 2389 (FEAT and OPTS), RFC 3659 (SIZE, MDTM, MLST, MLSD and REST), RFC 2640 (UTF-8), RFC 2577 (security) and RFC 8446
+//! section 6.1 (`close_notify`) are used where they apply, and the documentation of each module names the sections.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

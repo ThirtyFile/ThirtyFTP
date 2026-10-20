@@ -116,6 +116,7 @@ impl Backend for Memory {
     async fn write(&self, _: &String, path: &FtpPath, data: &mut (dyn AsyncRead + Send + Unpin)) -> Result<u64, FsError> {
         match path.file_name() {
             Some("full.bin") => return Err(FsError::QuotaExceeded),
+            Some("busy.bin") => return Err(FsError::Unavailable),
             Some("panic.bin") => panic!("the backend panics"),
             _ => {}
         }

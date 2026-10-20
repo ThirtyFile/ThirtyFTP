@@ -1,6 +1,6 @@
 [package]
 name = "thirtyftp"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "A small FTP and FTPS (explicit TLS) server library for receive folders: passive mode, uploads, optional listing and downloads"
@@ -9,6 +9,7 @@ repository = "https://github.com/ThirtyFile/ThirtyFTP"
 readme = "README.md"
 keywords = ["ftp", "ftps", "server", "tokio", "rustls"]
 categories = ["network-programming"]
+exclude = ["/.github", "/fuzz", "/scripts", "/deny.toml", "/rustfmt.toml", "/rust-toolchain.toml"]
 
 [dependencies]
 async-trait = "0.1"
@@ -30,4 +31,4 @@ all = { level = "warn", priority = -1 }
 proptest = "1"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 suppaftp = { version = "12", features = ["tokio-rustls-aws-lc-rs"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util", "fs"] }
