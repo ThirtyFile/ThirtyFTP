@@ -11,13 +11,17 @@ that needs an FTP endpoint.
 
 ## Add it
 
-```toml
-[dependencies]
-thirtyftp = { git = "https://github.com/ThirtyFile/ThirtyFTP" }
-tokio = { version = "1", features = ["full"] }
+```sh
+cargo add thirtyftp tokio --features tokio/full
 ```
 
-(It will be on crates.io; then `thirtyftp = "0.1"`.)
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+thirtyftp = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
 
 ## A server in one file
 
