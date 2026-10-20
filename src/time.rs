@@ -40,6 +40,8 @@ pub(crate) fn mlsx(time: SystemTime) -> String {
 }
 
 /// The date column of `ls -l`: `Oct 20 12:34` for a time within the last six months, `Oct 20  2025` for the others
+// `utc` gives a month from 1 to 12
+#[allow(clippy::indexing_slicing)]
 pub(crate) fn ls(time: SystemTime, now: SystemTime) -> String {
     let t = utc(time);
     let recent = now.duration_since(time).map(|age| age < Duration::from_secs(182 * 86400)).unwrap_or(false);

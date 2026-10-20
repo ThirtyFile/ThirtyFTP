@@ -85,6 +85,8 @@ impl LineReader {
         self.telnet = Telnet::Data;
     }
 
+    // `position` is below `length`, which is at most the size of the buffer
+    #[allow(clippy::indexing_slicing)]
     fn take_line(&mut self) -> Option<Line> {
         while self.position < self.length {
             let byte = self.buffer[self.position];

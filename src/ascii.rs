@@ -40,6 +40,8 @@ impl<R> Converting<R> {
         Converting { inner, direction, out: Vec::new(), position: 0, scratch: Box::new([0; CHUNK]), after_cr: false, done: false }
     }
 
+    // The index is below `input_length`, which is at most the size of the scratch buffer
+    #[allow(clippy::indexing_slicing)]
     fn convert(&mut self, input_length: usize) {
         for index in 0..input_length {
             let byte = self.scratch[index];
@@ -73,6 +75,8 @@ impl<R> Converting<R> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for Converting<R> {
+    // `position` is below the length of `out`, and `count` is at most what is left of it
+    #[allow(clippy::indexing_slicing)]
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         loop {

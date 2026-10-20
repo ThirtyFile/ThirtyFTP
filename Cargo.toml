@@ -21,11 +21,13 @@ tracing = "0.1"
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
 [dev-dependencies]
+proptest = "1"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 suppaftp = { version = "12", features = ["tokio-rustls-aws-lc-rs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }

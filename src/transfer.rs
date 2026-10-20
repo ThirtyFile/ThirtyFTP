@@ -156,6 +156,8 @@ async fn upload<B: Backend>(
 }
 
 /// The client receives what `reader` delivers
+// `read` is at most the size of the buffer
+#[allow(clippy::indexing_slicing)]
 async fn send<R: AsyncRead + Unpin>(mut reader: R, mut stream: Stream, idle: Duration, progress: Arc<AtomicU64>) -> Result<u64, Failure> {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut total = 0u64;

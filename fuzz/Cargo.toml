@@ -1,0 +1,44 @@
+[package]
+name = "thirtyftp-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+async-trait = "0.1"
+libfuzzer-sys = "0.4"
+thirtyftp = { path = ".." }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros"] }
+
+[workspace]
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path"
+path = "fuzz_targets/path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false

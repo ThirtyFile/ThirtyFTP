@@ -184,6 +184,8 @@ pub struct Server {
     pub events: Arc<Recorder>,
     /// How the sessions ended, in order
     pub ends: Arc<Mutex<Vec<SessionEnd>>>,
+    /// How many connections the server accepted. A session that panics never reports how it ended, so this is more than the ends
+    pub accepted: Arc<AtomicUsize>,
     accept: JoinHandle<()>,
 }
 
@@ -203,12 +205,14 @@ pub async fn start_with(config: Config) -> Server {
     let backend = Memory::new();
     let events = Arc::new(Recorder::default());
     let ends = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::new(AtomicUsize::new(0));
     let config = Arc::new(config);
     let accept = tokio::spawn({
-        let (backend, events, ends) = (backend.clone(), events.clone(), ends.clone());
+        let (backend, events, ends, accepted) = (backend.clone(), events.clone(), ends.clone(), accepted.clone());
         async move {
             loop {
                 let Ok((stream, peer)) = listener.accept().await else { return };
+                accepted.fetch_add(1, Ordering::SeqCst);
                 let (config, backend, events, ends) = (config.clone(), backend.clone(), events.clone(), ends.clone());
                 tokio::spawn(async move {
                     let end = serve(stream, peer, config, backend, events).await;
@@ -217,7 +221,7 @@ pub async fn start_with(config: Config) -> Server {
             }
         }
     });
-    Server { address, backend, events, ends, accept }
+    Server { address, backend, events, ends, accepted, accept }
 }
 
 /// A client that sends what it is told to, and reads replies

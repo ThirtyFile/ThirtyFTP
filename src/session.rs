@@ -56,8 +56,10 @@ pub async fn serve<B: Backend>(stream: TcpStream, peer: SocketAddr, config: Arc<
         Ok(local) => local,
         Err(error) => return SessionEnd::Io(error),
     };
+    let span = tracing::info_span!("ftp_session", %peer, user = tracing::field::Empty);
     let data_tls = config.tls.as_ref().map(tls::for_data);
     let mut session = Session {
+        span: span.clone(),
         stream: Stream::Plain(stream),
         lines: LineReader::new(config.limits.max_line),
         config,
@@ -78,7 +80,6 @@ pub async fn serve<B: Backend>(stream: TcpStream, peer: SocketAddr, config: Arc<
         data_private: false,
         data_tls,
     };
-    let span = tracing::info_span!("ftp_session", %peer);
     async move {
         let end = session.run().await;
         debug!(?end, "session ended");
@@ -138,6 +139,8 @@ struct Session<B: Backend> {
     data_private: bool,
     /// The TLS settings of data connections
     data_tls: Option<Arc<rustls::ServerConfig>>,
+    /// The span of the session's log lines; the user is added when they sign in
+    span: tracing::Span,
 }
 
 impl<B: Backend> Drop for Session<B> {
@@ -376,6 +379,7 @@ impl<B: Backend> Session<B> {
         if let Some(running) = self.transfer.take() {
             running.handle.abort();
             let _ = running.handle.await;
+            info!(direction = ?running.info.direction, path = %running.info.path, "transfer aborted");
             self.events.transfer_ended(self.peer, self.user_name(), &running.info, &TransferEnd::Aborted);
         }
     }
@@ -401,6 +405,10 @@ impl<B: Backend> Session<B> {
                     Err(_) => TransferEnd::Failed,
                 };
                 self.events.transfer_ended(self.peer, self.user_name(), &running.info, &end);
+                match &end {
+                    TransferEnd::Completed(bytes) => info!(direction = ?running.info.direction, path = %running.info.path, bytes, "transfer completed"),
+                    _ => info!(direction = ?running.info.direction, path = %running.info.path, "transfer failed"),
+                }
                 let reply = match result {
                     Ok(_) => Reply::new(226, text::DATA_CLOSED),
                     Err(Failure::NoConnection) => Reply::new(425, "Can't open data connection."),
@@ -442,6 +450,7 @@ impl<B: Backend> Session<B> {
         match self.backend.login(&context, &name, &password).await {
             Ok(user) => {
                 info!(user = %name, "signed in");
+                self.span.record("user", name.as_str());
                 self.events.signed_in(self.peer, &name);
                 self.login = Login::SignedIn { name, user: Arc::new(user) };
                 self.reply(230, text::LOGGED_IN).await
