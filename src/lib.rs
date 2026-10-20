@@ -19,6 +19,7 @@ mod path;
 mod reply;
 mod session;
 mod time;
+mod tls;
 mod transfer;
 
 pub use backend::{Backend, Entry, EntryKind, FsError, LoginContext, LoginError};

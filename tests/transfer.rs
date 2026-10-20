@@ -642,7 +642,7 @@ async fn many_uploads_at_once() {
     for index in 0..20 {
         let server_address = server.address;
         tasks.push(tokio::spawn(async move {
-            let mut client = Client { reader: tokio::io::BufReader::new(TcpStream::connect(server_address).await.unwrap()) };
+            let mut client = Client::connect_raw(server_address).await;
             assert_eq!(client.reply().await.0, 220);
             client.login().await;
             let data = pattern(200_000 + index);

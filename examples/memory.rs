@@ -4,6 +4,13 @@
 //! cargo run --example memory
 //! curl --user alice:secret ftp://127.0.0.1:2121/
 //! ```
+//!
+//! With the argument `tls` it offers explicit FTPS, with a certificate made for the run (so a client has to be told to trust it):
+//!
+//! ```sh
+//! cargo run --example memory -- tls
+//! curl --ssl-reqd --insecure --user alice:secret ftp://127.0.0.1:2121/
+//! ```
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -17,7 +24,12 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:2121").await?;
     println!("Listening on {}", listener.local_addr()?);
     let backend = common::Memory::new();
-    let config = Arc::new(Config::default());
+    let mut config = Config::default();
+    if std::env::args().any(|argument| argument == "tls") {
+        config.tls = Some(common::tls().server);
+        println!("Explicit FTPS is on");
+    }
+    let config = Arc::new(config);
     loop {
         let (stream, peer) = listener.accept().await?;
         let (config, backend) = (config.clone(), backend.clone());

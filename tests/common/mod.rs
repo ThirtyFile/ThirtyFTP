@@ -4,12 +4,15 @@
 
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thirtyftp::{Backend, Config, Entry, Events, FsError, FtpPath, LoginContext, LoginError, SessionEnd, TransferEnd, TransferInfo, serve};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -121,6 +124,10 @@ impl Backend for Memory {
         let mut bytes = Vec::new();
         data.read_to_end(&mut bytes).await.map_err(|e| FsError::Local(e.to_string()))?;
         let length = bytes.len() as u64;
+        if path.file_name() == Some("slowend.bin") {
+            // The storage takes its time after the last byte, as a big file being moved into place does
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
         // Stored only when the data came to its end
         self.files.lock().unwrap().insert(path.to_string(), bytes);
         guard.done = true;
@@ -215,7 +222,132 @@ pub async fn start_with(config: Config) -> Server {
 
 /// A client that sends what it is told to, and reads replies
 pub struct Client {
-    pub reader: BufReader<TcpStream>,
+    pub reader: BufReader<Conn>,
+    pub peer: SocketAddr,
+}
+
+/// A connection of the test client: plain, or TLS after `AUTH TLS`
+pub enum Conn {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    Gone,
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Conn::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Conn::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+            Conn::Gone => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Conn::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Conn::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+            Conn::Gone => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Conn::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Conn::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+            Conn::Gone => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Conn::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Conn::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+            Conn::Gone => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+}
+
+/// A certificate for `localhost` made for the test, the settings of a server and of a client that trusts it, and a count of the TLS 1.3 session
+/// tickets the client has been given
+pub struct Tls {
+    pub server: Arc<rustls::ServerConfig>,
+    pub client: Arc<rustls::ClientConfig>,
+    pub tickets: Arc<Tickets>,
+}
+
+/// A session store of a client that counts the tickets it is given
+#[derive(Debug)]
+pub struct Tickets {
+    memory: rustls::client::ClientSessionMemoryCache,
+    count: AtomicUsize,
+}
+
+impl Tickets {
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+impl rustls::client::ClientSessionStore for Tickets {
+    fn set_kx_hint(&self, server_name: rustls::pki_types::ServerName<'static>, group: rustls::NamedGroup) {
+        self.memory.set_kx_hint(server_name, group)
+    }
+
+    fn kx_hint(&self, server_name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.memory.kx_hint(server_name)
+    }
+
+    fn set_tls12_session(&self, server_name: rustls::pki_types::ServerName<'static>, value: rustls::client::Tls12ClientSessionValue) {
+        self.memory.set_tls12_session(server_name, value)
+    }
+
+    fn tls12_session(&self, server_name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.memory.tls12_session(server_name)
+    }
+
+    fn remove_tls12_session(&self, server_name: &rustls::pki_types::ServerName<'static>) {
+        self.memory.remove_tls12_session(server_name)
+    }
+
+    fn insert_tls13_ticket(&self, server_name: rustls::pki_types::ServerName<'static>, value: rustls::client::Tls13ClientSessionValue) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.memory.insert_tls13_ticket(server_name, value)
+    }
+
+    fn take_tls13_ticket(&self, server_name: &rustls::pki_types::ServerName<'static>) -> Option<rustls::client::Tls13ClientSessionValue> {
+        self.memory.take_tls13_ticket(server_name)
+    }
+}
+
+pub fn tls() -> Tls {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let certificate: CertificateDer<'static> = generated.cert.der().clone();
+    let key = PrivateKeyDer::try_from(generated.signing_key.serialize_der()).unwrap();
+    let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate).unwrap();
+    let tickets = Arc::new(Tickets { memory: rustls::client::ClientSessionMemoryCache::new(32), count: AtomicUsize::new(0) });
+    let mut client =
+        rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+    client.resumption = rustls::client::Resumption::store(tickets.clone());
+    Tls { server: Arc::new(server), client: Arc::new(client), tickets }
+}
+
+impl Tls {
+    /// Does the client side of a TLS handshake on a connection, as to `localhost`
+    pub async fn connect(&self, stream: TcpStream) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        tokio_rustls::TlsConnector::from(self.client.clone()).connect(name, stream).await.unwrap()
+    }
 }
 
 impl Client {
@@ -228,7 +360,39 @@ impl Client {
     }
 
     pub async fn connect_silent(server: &Server) -> Client {
-        Client { reader: BufReader::new(TcpStream::connect(server.address).await.unwrap()) }
+        Client::connect_raw(server.address).await
+    }
+
+    /// Connects, and reads nothing
+    pub async fn connect_raw(address: SocketAddr) -> Client {
+        Client { reader: BufReader::new(Conn::Plain(TcpStream::connect(address).await.unwrap())), peer: address }
+    }
+
+    /// `AUTH TLS` and the handshake
+    pub async fn upgrade(&mut self, tls: &Tls) {
+        assert_eq!(self.code("AUTH TLS").await, 234);
+        self.start_tls(tls).await;
+    }
+
+    /// The handshake, after the server has said 234
+    pub async fn start_tls(&mut self, tls: &Tls) {
+        assert!(self.reader.buffer().is_empty(), "the server sent something after the 234");
+        let Conn::Plain(stream) = std::mem::replace(self.reader.get_mut(), Conn::Gone) else { panic!("not plain") };
+        self.reader = BufReader::new(Conn::Tls(Box::new(tls.connect(stream).await)));
+    }
+
+    /// `AUTH TLS`, the sign-in, `PBSZ 0` and `PROT P`
+    pub async fn secure_login(&mut self, tls: &Tls) {
+        self.upgrade(tls).await;
+        self.login().await;
+        assert_eq!(self.code("PBSZ 0").await, 200);
+        assert_eq!(self.code("PROT P").await, 200);
+    }
+
+    /// Whether the server ended the TLS connection with a close_notify (and not by cutting it)
+    pub async fn closed_cleanly(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        matches!(tokio::time::timeout(Duration::from_secs(5), self.reader.read(&mut byte)).await, Ok(Ok(0)))
     }
 
     pub async fn send(&mut self, line: &str) {
@@ -306,7 +470,7 @@ impl Client {
         assert_eq!(code, 229, "{lines:?}");
         let start = lines[0].find("(|||").unwrap() + 4;
         let end = lines[0].find("|)").unwrap();
-        SocketAddr::new(self.reader.get_ref().peer_addr().unwrap().ip(), lines[0][start..end].parse().unwrap())
+        SocketAddr::new(self.peer.ip(), lines[0][start..end].parse().unwrap())
     }
 
     /// Whether the server has closed the connection (nothing more to read)

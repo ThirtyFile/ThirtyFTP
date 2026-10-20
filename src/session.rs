@@ -10,6 +10,7 @@ use crate::passive;
 use crate::path::FtpPath;
 use crate::reply::{Reply, text};
 use crate::time;
+use crate::tls::{self, Stream};
 use crate::transfer::{self, Event, Failure, Job, Work};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -37,6 +38,8 @@ pub enum SessionEnd {
     TooManyLoginFailures,
     /// The backend couldn't decide on a sign-in ([`LoginError::Unavailable`])
     LoginUnavailable,
+    /// The TLS handshake after `AUTH TLS` failed. The connection was closed
+    TlsHandshakeFailed,
     /// Reading or writing the connection failed
     Io(io::Error),
 }
@@ -52,8 +55,9 @@ pub async fn serve<B: Backend>(stream: TcpStream, peer: SocketAddr, config: Arc<
         Ok(local) => local,
         Err(error) => return SessionEnd::Io(error),
     };
-    let session = Session {
-        stream,
+    let data_tls = config.tls.as_ref().map(tls::for_data);
+    let mut session = Session {
+        stream: Stream::Plain(stream),
         lines: LineReader::new(config.limits.max_line),
         config,
         backend,
@@ -69,11 +73,15 @@ pub async fn serve<B: Backend>(stream: TcpStream, peer: SocketAddr, config: Arc<
         epsv_all: false,
         rest: None,
         transfer: None,
+        pbsz: false,
+        data_private: false,
+        data_tls,
     };
     let span = tracing::info_span!("ftp_session", %peer);
     async move {
         let end = session.run().await;
         debug!(?end, "session ended");
+        session.close().await;
         end
     }
     .instrument(span)
@@ -101,7 +109,7 @@ struct Running {
 }
 
 struct Session<B: Backend> {
-    stream: TcpStream,
+    stream: Stream,
     lines: LineReader,
     config: Arc<Config>,
     backend: Arc<B>,
@@ -122,6 +130,12 @@ struct Session<B: Backend> {
     /// The offset of `REST`, for the next command
     rest: Option<u64>,
     transfer: Option<Running>,
+    /// `PBSZ` was sent (RFC 4217 section 8)
+    pbsz: bool,
+    /// The protection level of the data connections is `P` (private: TLS). It is `C` (clear) until `PROT P`
+    data_private: bool,
+    /// The TLS settings of data connections
+    data_tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl<B: Backend> Drop for Session<B> {
@@ -160,7 +174,7 @@ enum ListKind {
 }
 
 impl<B: Backend> Session<B> {
-    async fn run(mut self) -> SessionEnd {
+    async fn run(&mut self) -> SessionEnd {
         info!("connected");
         let greeting = Reply::new(220, &self.config.greeting);
         if let Err(error) = self.send(greeting).await {
@@ -202,6 +216,11 @@ impl<B: Backend> Session<B> {
                 Err(error) => return SessionEnd::Io(error),
             }
         }
+    }
+
+    /// Ends the connection: over TLS with a `close_notify`, so the client can tell the end from a cut
+    async fn close(&mut self) {
+        let _ = timeout(Duration::from_secs(2), self.stream.shutdown()).await;
     }
 
     /// Sends a reply. A client that doesn't read it can't keep the session waiting longer than the idle time
@@ -309,9 +328,9 @@ impl<B: Backend> Session<B> {
             Command::Size(argument) => self.size(&argument).await,
             Command::Mdtm(argument) => self.modification_time(&argument).await,
             Command::Mlst(argument) => self.mlst(argument.as_deref()).await,
-            // Later milestones
-            Command::Auth(_) => self.reply(502, text::NOT_IMPLEMENTED).await,
-            Command::Pbsz(_) | Command::Prot(_) => self.reply(503, text::BAD_SEQUENCE).await,
+            Command::Auth(mechanism) => self.auth(&mechanism).await,
+            Command::Pbsz(_) => self.protection_buffer().await,
+            Command::Prot(level) => self.protection(&level).await,
             Command::Unsupported(_) => self.reply(502, text::NOT_IMPLEMENTED).await,
         }
     }
@@ -382,6 +401,7 @@ impl<B: Backend> Session<B> {
                 let reply = match result {
                     Ok(_) => Reply::new(226, text::DATA_CLOSED),
                     Err(Failure::NoConnection) => Reply::new(425, "Can't open data connection."),
+                    Err(Failure::Tls) => Reply::new(425, "Can't open data connection: the TLS handshake failed."),
                     Err(Failure::Aborted) => Reply::new(426, "Connection closed; transfer aborted."),
                     Err(Failure::Storage(error)) => {
                         if let FsError::Local(message) = &error {
@@ -399,8 +419,8 @@ impl<B: Backend> Session<B> {
         if self.signed_in() {
             return self.reply(503, "Already logged in.").await;
         }
-        if self.config.require_tls {
-            return self.reply(530, "Login needs an encrypted connection.").await;
+        if self.config.require_tls && !self.stream.is_encrypted() {
+            return self.reply(530, "Login needs an encrypted connection. Use AUTH TLS.").await;
         }
         self.login = Login::UserGiven(name);
         self.reply(331, text::NEED_PASSWORD).await
@@ -413,9 +433,9 @@ impl<B: Backend> Session<B> {
                 self.login = signed_in;
                 return self.reply(503, "Already logged in.").await;
             }
-            Login::New => return self.reply(503, "Login with USER first.").await,
+            Login::New => return self.reply(503, text::BAD_SEQUENCE).await,
         };
-        let context = LoginContext { peer: self.peer, local: self.local, encrypted: false };
+        let context = LoginContext { peer: self.peer, local: self.local, encrypted: self.stream.is_encrypted() };
         match self.backend.login(&context, &name, &password).await {
             Ok(user) => {
                 info!(user = %name, "signed in");
@@ -445,7 +465,7 @@ impl<B: Backend> Session<B> {
 
     /// The lines of FEAT (RFC 2389), for what is done
     fn features(&self) -> Vec<String> {
-        vec![
+        let mut features = vec![
             "EPSV".to_string(),
             "MDTM".to_string(),
             format!("MLST {}", self.facts.names(true)),
@@ -453,7 +473,72 @@ impl<B: Backend> Session<B> {
             "REST STREAM".to_string(),
             "SIZE".to_string(),
             "UTF8".to_string(),
-        ]
+        ];
+        if self.config.tls.is_some() {
+            features.extend(["AUTH TLS".to_string(), "PBSZ".to_string(), "PROT".to_string()]);
+        }
+        features
+    }
+
+    /// AUTH TLS (RFC 4217 section 4): the TLS handshake starts right after the reply, on the same connection
+    async fn auth(&mut self, mechanism: &str) -> Outcome {
+        let Some(tls) = self.config.tls.clone() else { return self.reply(502, "TLS is not available.").await };
+        if self.signed_in() || self.stream.is_encrypted() {
+            return self.reply(503, "TLS can't be started now.").await;
+        }
+        if !matches!(mechanism.to_ascii_uppercase().as_str(), "TLS" | "TLS-C") {
+            return self.reply(504, text::NOT_IMPLEMENTED_PARAMETER).await;
+        }
+        self.reply(234, "AUTH TLS successful.").await?;
+        // Whatever the client sent after AUTH TLS was sent before it saw the 234, in plain text: it is never read, and never answered
+        self.lines.discard_buffered();
+        self.login = Login::New;
+        self.pbsz = false;
+        self.data_private = false;
+        match self.stream.accept_tls(tls, self.config.limits.tls_handshake_timeout).await {
+            Ok(()) => {
+                debug!("control connection is encrypted");
+                Ok(None)
+            }
+            Err(error) => {
+                debug!(%error, "TLS handshake on the control connection failed");
+                Ok(Some(SessionEnd::TlsHandshakeFailed))
+            }
+        }
+    }
+
+    /// PBSZ (RFC 4217 section 8): TLS has no protection buffer, so the size is 0
+    async fn protection_buffer(&mut self) -> Outcome {
+        if !self.stream.is_encrypted() {
+            return self.reply(503, "PBSZ needs AUTH TLS first.").await;
+        }
+        self.pbsz = true;
+        self.reply(200, "PBSZ=0").await
+    }
+
+    /// PROT (RFC 4217 section 9): whether the data connections are protected
+    async fn protection(&mut self, level: &str) -> Outcome {
+        if !self.stream.is_encrypted() || !self.pbsz {
+            return self.reply(503, "PROT needs AUTH TLS and PBSZ first.").await;
+        }
+        match level.to_ascii_uppercase().as_str() {
+            "P" => {
+                self.data_private = true;
+                self.reply(200, "PROT now Private.").await
+            }
+            "C" => {
+                self.data_private = false;
+                self.reply(200, "PROT now Clear.").await
+            }
+            "S" | "E" => self.reply(536, "Requested PROT level not supported by mechanism.").await,
+            _ => self.reply(504, text::NOT_IMPLEMENTED_PARAMETER).await,
+        }
+    }
+
+    /// The policy for data connections: a host that requires TLS has them encrypted. It is checked whenever a data connection is about to be used, not
+    /// only when it is announced: the level can change in between, and `PROT C` after `PASV` must not give a transfer in plain text
+    fn data_policy(&self) -> Option<Reply> {
+        (self.config.require_tls && !self.data_private).then(|| Reply::new(534, "Data connections must be encrypted. Use PROT P."))
     }
 
     async fn opts(&mut self, name: &str, value: Option<&str>) -> Outcome {
@@ -501,7 +586,8 @@ impl<B: Backend> Session<B> {
         let lines = [
             "FTP server status:".to_string(),
             format!("Connected from {}", self.peer.ip()),
-            "Control connection is not encrypted".to_string(),
+            format!("Control connection is {}", if self.stream.is_encrypted() { "encrypted" } else { "not encrypted" }),
+            format!("Data connections are {}", if self.data_private { "encrypted" } else { "not encrypted" }),
             user,
             format!("TYPE: {}, STRU: File, MODE: Stream", if self.ascii { "ASCII" } else { "BINARY" }),
             "End of status".to_string(),
@@ -625,6 +711,10 @@ impl<B: Backend> Session<B> {
 
     /// PASV and EPSV: a new listener, and the old one is closed first, so a session never holds two ports (RFC 959 section 4.1.2, RFC 2428)
     async fn passive_mode(&mut self, extended: bool) -> Outcome {
+        if let Some(reply) = self.data_policy() {
+            self.passive = None;
+            return self.send_reply(reply).await;
+        }
         if !extended && self.epsv_all {
             return self.reply(501, "PASV is not allowed after EPSV ALL.").await;
         }
@@ -708,6 +798,9 @@ impl<B: Backend> Session<B> {
     }
 
     async fn listing(&mut self, kind: ListKind, argument: Option<String>) -> Outcome {
+        if let Some(reply) = self.data_policy() {
+            return self.send_reply(reply).await;
+        }
         if self.passive.is_none() {
             return self.reply(425, "Use PASV or EPSV first.").await;
         }
@@ -732,6 +825,9 @@ impl<B: Backend> Session<B> {
     }
 
     async fn retrieve(&mut self, argument: &str, offset: u64) -> Outcome {
+        if let Some(reply) = self.data_policy() {
+            return self.send_reply(reply).await;
+        }
         if self.passive.is_none() {
             return self.reply(425, "Use PASV or EPSV first.").await;
         }
@@ -752,6 +848,9 @@ impl<B: Backend> Session<B> {
     }
 
     async fn store(&mut self, argument: &str, offset: u64) -> Outcome {
+        if let Some(reply) = self.data_policy() {
+            return self.send_reply(reply).await;
+        }
         if self.passive.is_none() {
             return self.reply(425, "Use PASV or EPSV first.").await;
         }
@@ -768,6 +867,10 @@ impl<B: Backend> Session<B> {
 
     /// Starts the task of a transfer: it waits for the data connection, and the session goes on with the control connection
     async fn start_transfer(&mut self, work: Work, info: TransferInfo) -> Outcome {
+        // The last check before the data connection is used
+        if let Some(reply) = self.data_policy() {
+            return self.send_reply(reply).await;
+        }
         let Some(listener) = self.passive.take() else { return self.reply(425, "Use PASV or EPSV first.").await };
         let Some(user) = self.user() else { return self.reply(530, text::NOT_LOGGED_IN).await };
         let (sender, receiver) = mpsc::channel(4);
@@ -779,6 +882,8 @@ impl<B: Backend> Session<B> {
             client: self.peer.ip(),
             accept_timeout: self.config.limits.data_accept_timeout,
             idle_timeout: self.config.limits.transfer_idle_timeout,
+            tls: if self.data_private { self.data_tls.clone() } else { None },
+            handshake_timeout: self.config.limits.tls_handshake_timeout,
             progress: progress.clone(),
             events: sender,
         };

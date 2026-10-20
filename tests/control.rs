@@ -520,7 +520,7 @@ async fn many_sessions_at_once() {
     for _ in 0..50 {
         let address = server.address;
         tasks.push(tokio::spawn(async move {
-            let mut client = Client { reader: tokio::io::BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap()) };
+            let mut client = Client::connect_raw(address).await;
             assert_eq!(client.reply().await.0, 220);
             client.login().await;
             assert_eq!(client.command("PWD").await.0, 257);
