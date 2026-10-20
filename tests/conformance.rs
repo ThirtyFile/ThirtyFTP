@@ -1,4 +1,5 @@
-//! The conformance tables of the README: every row names tests that exist, so a row can't say "done" for what nothing shows
+//! The conformance tables (the `conformance` module of the crate documentation): every row names tests that exist, so a row can't say "done" for what
+//! nothing shows
 
 use std::path::Path;
 
@@ -35,19 +36,16 @@ fn every_row_of_the_conformance_tables_names_tests_that_exist() {
     let mut sources = Vec::new();
     rust_files(&root.join("src"), &mut sources);
     rust_files(&root.join("tests"), &mut sources);
-    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    // The tables are the documentation of a module: the lines start with `//!`
+    let page = std::fs::read_to_string(root.join("src").join("conformance.rs")).unwrap().replace("\r\n", "\n");
+    let readme: String = page.lines().map(|line| line.strip_prefix("//! ").or_else(|| line.strip_prefix("//!")).unwrap_or(line)).collect::<Vec<_>>().join("\n");
 
     let mut rows = 0;
     let mut names = 0;
     let mut missing = Vec::new();
     let mut without_tests = Vec::new();
-    let mut in_table = false;
     for line in readme.lines() {
-        // The tables are under "## Conformance"
-        if line.starts_with("## ") {
-            in_table = line.starts_with("## Conformance");
-        }
-        if !in_table || !line.starts_with('|') || line.starts_with("| ---") || line.starts_with("| Requirement") || line.starts_with("| Behaviour") {
+        if !line.starts_with('|') || line.starts_with("| ---") || line.starts_with("| Requirement") || line.starts_with("| Behaviour") {
             continue;
         }
         let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();

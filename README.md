@@ -1,174 +1,232 @@
 # ThirtyFTP
 
-A small FTP and FTPS server library for Rust, made for **receive folders**: devices such as scanners and cameras upload files into one folder. It is
-written for [ThirtyFile](https://github.com/ThirtyFile/ThirtyFile), and does one job well instead of every job: explicit FTPS, passive mode, uploads,
-and listing and downloads when the host allows them.
+A small FTP and FTPS server library for Rust, on Tokio and rustls. You accept the connections; ThirtyFTP speaks the protocol; a backend that you write
+decides who may sign in and where the files go. It suits **receive folders**, where scanners, cameras and other devices upload files, and any program
+that needs an FTP endpoint.
 
-- On Tokio and rustls, few dependencies, `#![forbid(unsafe_code)]`, and no `unwrap`, `expect`, `panic` or unchecked index in the library: what a client
-  sends is a reply or a closed connection, never a crash. A `Backend` is written with `async fn`; the library needs no `async-trait`.
-- The host accepts the connections and decides who may connect; the library speaks the protocol (`serve`), and a `Backend` that you write knows the users
-  and the storage.
-- Passive mode and explicit FTPS (`AUTH TLS`, RFC 4217). Active mode (`PORT`, `EPRT`) is an option, off by default, restricted as RFC 2577 asks.
-- Not provided, and refused: deleting, renaming and removing (`550`), `SITE` and the rest of RFC 959 that has no use here (`502`), implicit FTPS on
-  port 990, proxy protocol.
+- Passive mode and explicit FTPS (`AUTH TLS`); active mode as an option
+- Uploads, and listing and downloads when your backend allows them; making folders
+- Deleting, renaming and `SITE` are refused, as a receive folder keeps what it is sent
+- No `unsafe`, and no panic on anything a client sends
 
-Version 0.1.0 is the first version. It is not published on crates.io yet.
+## Add it
 
-## Use
-
-```rust
-let config = std::sync::Arc::new(thirtyftp::Config::default());
-// For every TCP connection you accept:
-tokio::spawn(thirtyftp::serve(stream, peer, config.clone(), backend.clone(), events.clone()));
+```toml
+[dependencies]
+thirtyftp = { git = "https://github.com/ThirtyFile/ThirtyFTP" }
+tokio = { version = "1", features = ["full"] }
 ```
 
-The crate documentation has a complete example, and [`examples/receive_folder.rs`](examples/receive_folder.rs) is a working receive folder that stores
-uploads on disk (`cargo run --example receive_folder -- --dir ./incoming --user scanner --password change-me`).
+(It will be on crates.io; then `thirtyftp = "0.1"`.)
 
-The crate follows rustls 0.23 and Tokio 1 in its public API (`Config::tls` is a `rustls::ServerConfig`, `serve` takes a `tokio::net::TcpStream`). It
-asks rustls for no crypto provider: the host builds the `ServerConfig` with the provider it uses (`aws-lc-rs` or `ring`), and enables the `tls12`
-feature of rustls when old devices must be served, as many scanners and cameras speak TLS 1.2 only. It is built and tested with Rust 1.96.
+## A server in one file
 
-### What a backend has to know
+A backend answers six questions: who may sign in, what a path is, what a folder holds, how to read a file, how to store one, and how to make a folder.
+This one accepts one user and counts the bytes of what is uploaded:
 
-- **Paths** reach the backend as `FtpPath`: absolute, with `.` and `..` resolved, never above the root, without control characters. For a folder on
-  disk, `FtpPath::to_native(root)` gives the place of the path and refuses the names that Windows treats in its own way (`..\x`, `C:`, `*`, `CON`,
-  `aux.txt`, a name that ends with a dot); `to_portable` applies the same rules on every system.
-- **An upload that did not complete is not kept.** `Backend::write` is given the data as a reader. If its future is dropped (the client sent `ABOR`, the
-  control connection closed, the host stopped the session) or the reader fails (the connection was cut, the transfer stood still), the backend must not
-  keep a partial file, and must keep the file that was there before. Over TLS an upload that ends without the client's `close_notify` was cut: the reader
-  fails, and the client never gets a `226` for it. `write` reads to the end of the data: a backend that returns `Ok` while the client still sends has
-  not stored the upload, and the client is told so. The size of a file is the backend's to limit (return `FsError::QuotaExceeded`; the example does it
-  with `take`); the library moves what a client sends for as long as it sends it, or until `max_transfer_time`.
-- **Errors become replies.** `FsError` says what went wrong, and the library chooses the reply: a failure that may succeed later is `4xx`
-  (`Unavailable` is `450`, a failed storage `451`), the others `5xx` (RFC 1123 section 4.1.2.11). `FsError` has a `From<std::io::Error>`.
-- **Calls are timed.** A call of the backend that takes longer than `backend_timeout` gives the client `450` (a sign-in `421`), so a storage that hangs
-  does not hang the session. `write` is not timed: it ends with the upload.
-- **`QUIT` and a closed control connection let a transfer finish.** A camera that closes the data connection and the control connection at once has
-  finished its upload, whether or not it waited for the `226`: the transfer is given the time to end, as long as it moves
-  (`transfer_idle_timeout`). Only the host dropping the `serve` future, or `ABOR`, aborts it at once.
+```rust,no_run
+use std::sync::Arc;
+use thirtyftp::{Backend, Config, Entry, FsError, FtpPath, LoginContext, LoginError, NoEvents, serve};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::net::TcpListener;
 
-### Settings that matter
+struct Uploads;
 
-| Setting | Default | What it does |
-| --- | --- | --- |
-| `tls` | none | The `rustls::ServerConfig` for `AUTH TLS`. Data connections use it without TLS 1.3 session tickets |
-| `require_tls` | off | Needs `AUTH TLS` before `USER`, and `PROT P` before `PASV`, `EPSV`, `PORT`, `EPRT` and every transfer (`534`). The policy is checked when a data connection is announced and again when it is used, so `PROT C` after `PASV` can't give a transfer in plain text |
-| `idle_timeout` | 300 s | A control connection that sends no command for this time is closed without a reply. The time doesn't run during a transfer |
-| `passive_ports`, `passive_host` | 49152 to 65535, the address of the connection | The ports a data connection listens on, and the address `PASV` tells (an IPv4 address or a name, for a server behind NAT) |
-| `active_mode` | off | `PORT` and `EPRT`. The server connects only to the address of the control connection and only to ports from 1024 up |
-| `ascii_conversion` | off | With `TYPE A`, store `CRLF` as `LF` and send `LF` as `CRLF`. Off means the bytes of an ASCII transfer are not changed (as in vsftpd); `SIZE` is of the stored file either way |
-| `limits` | see the documentation | The longest command line (4096 bytes), failed sign-ins (3), the time to sign in (60 s: `NOOP` doesn't extend it), a call of the backend (60 s), the entries of a listing (100,000), the wait for a data connection (30 s), a transfer that stands still (60 s), the time a transfer may take in all (none), a TLS handshake (30 s) |
+impl Backend for Uploads {
+    type User = ();
 
-### Security notes
+    async fn login(&self, _: &LoginContext, user: &str, password: &str) -> Result<(), LoginError> {
+        if user == "scanner" && password == "change-me" { Ok(()) } else { Err(LoginError::Incorrect) }
+    }
 
-- A data connection is accepted only from the address of the control connection. A connection from another address is closed and the port keeps
-  waiting for the client, so one stray connection can't use up the port or take the transfer (RFC 2577).
-- A session has one passive port: a new `PASV` or `EPSV` closes the previous one at once, and the port is closed when its transfer is over.
-- `AUTH TLS` switches to TLS right after the `234`. What the client sent before it saw the reply is discarded, never answered in plain text.
-- A failed TLS handshake on a data connection refuses the transfer (`425`) before the backend is asked for anything.
-- A command line that is not UTF-8 is refused (`501`). Turning its bytes into U+FFFD would make `caf\xe9.pdf` and `caf\xe8.pdf` the same file.
-- A user name with a control character is refused before the backend, the log or the events see it.
-- A client that does not sign in within `login_timeout` is closed, and `NOOP` or `FEAT` don't extend that time. The host still limits the connections:
-  the example server keeps a count of them.
-- Data connections are protected by TLS, and tied to the client by its address. Two clients that share one address (behind the same NAT) could race for
-  a passive port: with TLS the other client does its own handshake and sends its own data. TLS 1.3 session tickets can't tie a data connection to
-  the control connection the way TLS 1.2 session reuse did, so the library does not offer it; where clients share an address, give each client
-  its own port range, or use a network where the address is the client.
-- The library counts failed sign-ins of a connection and closes it. Counting them per address or per user, and limiting how many connections there are,
-  is the host's, which accepts the connections.
+    async fn metadata(&self, _: &(), _: &FtpPath) -> Result<Entry, FsError> {
+        Err(FsError::PermissionDenied)
+    }
 
-## Conformance
+    async fn list(&self, _: &(), _: &FtpPath) -> Result<Vec<Entry>, FsError> {
+        Err(FsError::PermissionDenied)
+    }
 
-[RFC 959](https://www.rfc-editor.org/info/rfc959/) and section 4.1 of [RFC 1123](https://www.freesoft.org/CIE/RFC/1123/57.htm) are the base. The
-tables say, for each requirement, what the library does. Every row names the tests that show it, and a test of this repository checks that those tests
-exist.
+    async fn read(&self, _: &(), _: &FtpPath, _: u64) -> Result<Box<dyn AsyncRead + Send + Unpin>, FsError> {
+        Err(FsError::PermissionDenied)
+    }
 
-### RFC 1123 section 4.1 and RFC 959
+    async fn write(&self, _: &(), path: &FtpPath, data: &mut (dyn AsyncRead + Send + Unpin)) -> Result<u64, FsError> {
+        let mut bytes = Vec::new();
+        data.read_to_end(&mut bytes).await?;
+        println!("{path}: {} bytes", bytes.len());
+        Ok(bytes.len() as u64)
+    }
 
-| Requirement | Source | Status | Tests |
-| --- | --- | --- | --- |
-| Only correctly formatted replies: three digits and a space, or the multi-line form that ends with the same code and a space | 1123 4.1.2.11 | done | `a_reply_is_made_of_whole_lines`, `a_reply_of_several_lines_ends_with_the_code_and_a_space`, `a_line_in_the_middle_that_starts_with_digits_cannot_end_the_reply` |
-| No spontaneous replies: an idle connection is closed, not written to | 1123 4.1.2.11 | done | `an_idle_connection_is_closed_without_a_reply` |
-| Failures that may succeed later are 4xx, the others 5xx | 1123 4.1.2.11 | done | `what_may_work_later_is_4xx_and_what_will_not_is_5xx`, `a_backend_that_is_down_gives_421_and_closes`, `no_data_connection_in_time_is_425_and_the_session_goes_on`, `a_transfer_that_stands_still_is_aborted_with_426` |
-| The RFC 959 reply texts where the meaning matches | 1123 4.1.2.11 | done | `the_greeting_comes_first_and_can_be_set`, `signing_in`, `quit_closes_the_connection` |
-| Lines end with CRLF; a lone LF from a careless client is accepted; replies always use CRLF | 1123 4.1.2.10 | done | `commands_are_case_insensitive_and_a_lone_lf_ends_a_line`, `crlf_and_lone_lf` |
-| Telnet commands (`IAC`) on the control connection are removed; `IAC IAC` is the byte 255 | 959 4.1.3 | done | `telnet_commands_are_removed_from_a_line`, `telnet_options_and_sub_negotiations_are_removed`, `iac_iac_is_the_byte_255` |
-| `ABOR` and `STAT` at any time, also during a transfer | 959 4.1.3, 1123 4.1.3.3 | done | `abor_during_an_upload_is_answered_at_once_and_the_upload_is_dropped`, `abor_during_a_download`, `stat_during_a_transfer_shows_the_progress`, `stat_with_a_path_during_a_transfer_is_answered` |
-| `QUIT` while a transfer runs: the transfer ends, then the connection closes | 959 4.1.3 | done | `quit_during_a_transfer_waits_for_it_and_then_closes`, `quit_during_a_transfer_that_stands_still_ends_it_and_then_closes`, `abor_and_then_quit_in_one_go` |
-| The data connection is closed after each transfer in stream mode | 1123 4.1.2.12 | done | `a_data_connection_is_for_one_transfer` |
-| `USER`, `PASS`, `ACCT` | 1123 4.1.2.13 | done (`ACCT` is `202`) | `signing_in`, `type_mode_structure_and_allocation` |
-| `TYPE A N`, `I`, `L 8`; `MODE S`; `STRU F` (`STRU R`, `MODE B` and `C` are `504`) | 1123 4.1.2.13 | done | `type_mode_structure_and_allocation` |
-| `PORT` | 1123 4.1.2.13 | option, off by default | `it_is_off_by_default`, `upload_download_and_listing` |
-| `PASV` | 1123 4.1.2.13 | done | `pasv_tells_the_address_of_the_connection_and_a_port_that_listens`, `the_passive_host_can_be_set` |
-| `RETR`, `STOR` | 1123 4.1.2.13 | done | `upload_and_download`, `the_working_directory_is_where_a_file_goes` |
-| `APPE`, `RNFR`, `RNTO`, `DELE`, `RMD` | 1123 4.1.2.13 | recognised and refused on purpose (`550`: a receive folder keeps what it is sent) | `what_ftp_refuses_on_purpose_is_550_and_not_502` |
-| `CWD`, `CDUP`, `MKD`, `PWD` | 1123 4.1.2.13 | done | `the_working_directory`, `nothing_goes_above_the_root` |
-| `LIST`, `NLST` | 1123 4.1.2.13 | done (the backend decides whether listing is allowed); `NLST dir` gives `dir/name` as other servers do | `listings`, `list_is_the_ls_format`, `nlst_is_the_names`, `nlst_of_a_directory_gives_the_names_with_the_path_as_written`, `a_listing_that_is_too_long_is_451` |
-| `SYST`, `STAT`, `HELP`, `NOOP`, `QUIT` | 1123 4.1.2.13 | done (`STAT path` is `212` for a directory, `213` for a file) | `the_information_commands`, `stat_shows_the_connection`, `stat_with_a_path_lists_on_the_control_connection`, `quit_closes_the_connection` |
-| `REIN`, `SMNT`, `STOU`, `SITE` | 959 | recognised and refused (`502`) | `commands_that_are_not_done` |
-| The X forms `XMKD`, `XRMD`, `XPWD`, `XCUP`, `XCWD` | 1123 4.1.3.1 | done | `the_x_forms_are_the_same_commands` |
-| Idle timeout, configurable, by default at least 5 minutes | 1123 4.1.3.2 | done (300 s) | `the_defaults_follow_rfc_1123`, `every_command_resets_the_idle_time`, `a_client_that_sends_a_byte_now_and_then_is_still_idle` |
-| Restart: `554` for an invalid `REST` | 1123 4.1.3.4 | done for `RETR`; `STOR` with an offset is `554` (the backend stores whole files) | `rest_is_for_retr_and_for_the_next_command_only` |
-| Restart markers (`110`) | 959 3.5 | not applicable: there is no block mode | |
-| `TYPE A` transfers | 1123 4.1.2.13 | bytes unchanged by default; the conversion of line ends is an option | `by_default_ascii_transfers_do_not_change_the_bytes`, `with_the_conversion_on_ascii_files_are_stored_with_lf_and_sent_with_crlf` |
+    async fn make_dir(&self, _: &(), _: &FtpPath) -> Result<(), FsError> {
+        Err(FsError::PermissionDenied)
+    }
 
-### Other specifications
+    async fn change_dir(&self, _: &(), _: &FtpPath) -> Result<(), FsError> {
+        Ok(())
+    }
+}
 
-| Requirement | Source | Status | Tests |
-| --- | --- | --- | --- |
-| `AUTH TLS`, `PBSZ 0`, `PROT P` and `C`; `PROT S` and `E` are `536`; `CCC` is refused | RFC 2228, 4217 | done | `auth_tls_upgrades_the_control_connection`, `the_mechanisms_and_when_auth_is_allowed`, `pbsz_and_prot_need_their_order`, `upload_download_and_listings_over_tls` |
-| `EPSV`, `EPSV ALL`, the protocol argument; `EPRT` | RFC 2428 | done | `epsv_tells_only_the_port`, `epsv_all_and_the_protocol_argument`, `eprt_does_the_same`, `eprt_takes_a_protocol_an_address_and_a_port` |
-| `FEAT` and `OPTS` | RFC 2389 | done | `the_information_commands` |
-| `SIZE`, `MDTM`, `MLST`, `MLSD`, `OPTS MLST`, `REST STREAM` | RFC 3659 | done | `size_mdtm_and_mlst`, `opts_mlst_chooses_the_facts`, `known_dates` |
-| UTF-8 names and `OPTS UTF8 ON`; a line that is not UTF-8 is refused | RFC 2640 | done | `a_name_with_spaces_unicode_and_quotes`, `the_information_commands`, `bytes_that_are_not_utf8_do_not_stop_the_session`, `a_line_that_is_not_utf8_is_not_used_and_the_next_is_read` |
-| The server connects only to the address of the client and to ports from 1024 up | RFC 2577 | done | `the_server_connects_to_the_address_of_the_client_only`, `the_server_connects_to_ports_from_1024_up_only` |
-| A data connection from another address is not the data connection | RFC 2577 | done | `a_data_connection_from_another_address_is_closed_and_the_port_keeps_waiting`, `nothing_is_stored_from_a_stranger` |
-| Failed sign-ins are limited | RFC 2577 | done | `too_many_wrong_passwords_close_the_connection_with_421` |
-| A TLS connection ends with a `close_notify`; one that ends without it was cut | RFC 8446 6.1 | done | `an_upload_that_ends_without_a_close_notify_is_a_truncation_not_a_226`, `the_server_answers_the_end_of_an_upload_before_the_storage_is_done`, `the_control_connection_ends_with_a_close_notify` |
-| Implicit FTPS (port 990) | | not provided: the host accepts the connections | |
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:2121").await?;
+    let config = Arc::new(Config::default());
+    let backend = Arc::new(Uploads);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tokio::spawn(serve(stream, peer, config.clone(), backend.clone(), Arc::new(NoEvents)));
+    }
+}
+```
 
-### Behaviours designed in
-
-These are mistakes that other servers made. Each has a test that fails when the behaviour is taken out.
-
-| Behaviour | Tests |
-| --- | --- |
-| `AUTH TLS` switches to TLS right after the `234`; what the client sent in plain text before it saw the reply is never answered | `what_the_client_sent_after_auth_tls_in_plain_text_is_never_answered`, `discarding_what_was_read_drops_the_rest_of_the_chunk` |
-| One passive port per session: a new `PASV` or `EPSV` closes the previous one at once | `a_new_pasv_closes_the_previous_port_at_once`, `bind_skips_the_ports_in_use_and_fails_when_all_are` |
-| A data connection from another address is closed and the port keeps waiting for the client; addresses are compared in canonical form | `a_data_connection_from_another_address_is_closed_and_the_port_keeps_waiting`, `accept_from_closes_a_stranger_and_keeps_waiting_for_the_client`, `canonical_makes_the_two_forms_of_an_address_equal` |
-| The TLS policy is checked when the data connection is used, not only when it is announced; `EPSV` like `PASV`; `PROT C` after `PASV` can't give a plain transfer | `with_tls_required_pasv_and_epsv_are_refused_until_prot_p`, `prot_c_after_pasv_cannot_give_a_transfer_in_plain_text` |
-| A failed TLS handshake on a data connection refuses the transfer; it is never an empty transfer | `a_data_connection_that_is_not_tls_is_refused_and_nothing_is_stored`, `a_data_connection_that_never_starts_the_handshake_is_given_up` |
-| `ABOR` works during a transfer: nothing is locked across it, the transfer is dropped and a partial upload is discarded | `abor_during_an_upload_is_answered_at_once_and_the_upload_is_dropped`, `abor_during_a_tls_upload`, `quit_during_a_transfer_that_stands_still_ends_it_and_then_closes` |
-| A client that sends the end of the data and then quits or closes the control connection does not lose the upload | `a_control_connection_that_closes_after_the_data_does_not_lose_the_upload`, `quit_during_a_transfer_waits_for_it_and_then_closes`, `a_control_connection_that_closes_while_the_upload_stands_still_drops_the_upload` |
-| A backend that returns before it has read the whole upload does not get a `226` | `a_backend_that_returns_before_the_end_of_the_upload_is_not_a_226` |
-| A backend call that hangs, a client that never signs in, and settings of `Duration::MAX` don't hang or panic a session | `a_backend_call_that_takes_too_long_is_450_and_the_session_goes_on`, `a_sign_in_that_takes_too_long_is_421`, `the_time_to_sign_in_is_from_the_start_and_noop_does_not_extend_it`, `settings_with_huge_values_do_not_panic`, `a_huge_duration_is_far_away_and_does_not_panic` |
-| The longest a transfer may take can be limited, whatever it moves | `the_longest_a_transfer_may_take_is_limited_whatever_it_moves` |
-| The end of an FTPS upload: our `close_notify` before the storage is told, a missing one is a truncation and never a `226`; no TLS 1.3 tickets on data connections | `the_server_answers_the_end_of_an_upload_before_the_storage_is_done`, `an_upload_that_ends_without_a_close_notify_is_a_truncation_not_a_226`, `data_connections_get_no_session_tickets`, `idle_read_answers_the_end_of_the_data_with_the_end_of_its_own_before_it_reports_it` |
-| No panics on input: a malformed or huge line, a bad path, an early close | `made_up_commands_never_panic_or_hang_a_session`, `random_bytes_never_stop_the_server`, `a_line_that_is_too_long_is_500_and_the_session_goes_on`, `the_parser_never_panics_and_the_verb_is_not_case_sensitive`, `a_path_never_panics` |
-
-## Tested with
-
-The tests (about 250) run against [suppaftp](https://crates.io/crates/suppaftp) (plain FTP and FTPS, passive and extended passive mode). `scripts/interop.sh`
-runs `curl` (`ftp://` and `--ssl-reqd`), Python's `ftplib` (`FTP` and `FTP_TLS`) and `lftp` (plain and with TLS) against the example server: it passes
-on Linux (lftp 4.9 in Debian bookworm) and on Windows without lftp. Not tested yet: FileZilla, Windows Explorer and real scanners and cameras.
-
-The four fuzz targets (in a Linux container, on this version) ran for 60 seconds each: about 8.9 million inputs for the parser, 1.2 million for the
-codec, 2.5 million for paths and 60 thousand whole sessions, without a crash or a hang.
-
-## Development
+Try it with any client:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo deny check
-bash scripts/interop.sh   # curl, ftplib and lftp against the example server
+curl --user scanner:change-me -T photo.jpg ftp://127.0.0.1:2121/photo.jpg
+lftp -u scanner,change-me -e "put photo.jpg; bye" ftp://127.0.0.1:2121
+python3 -c "import ftplib; f = ftplib.FTP(); f.connect('127.0.0.1', 2121); f.login('scanner', 'change-me'); f.storbinary('STOR photo.jpg', open('photo.jpg', 'rb'))"
 ```
 
-The fuzz targets in `fuzz/` (parser, codec, paths and whole sessions) run with `cargo +nightly fuzz run <target>` on Linux or macOS. Property tests
-and a test with made-up sessions run with `cargo test`.
+## Store the files in a folder
+
+[`examples/receive_folder.rs`](examples/receive_folder.rs) is a complete receive folder: one user, a folder on disk, a size limit, a limit on the
+connections, and optional FTPS.
+
+```sh
+cargo run --example receive_folder -- --dir ./incoming --user scanner --password change-me
+cargo run --example receive_folder -- --dir ./incoming --user scanner --password change-me --cert cert.pem --key key.pem
+```
+
+The part of a backend that touches the disk is two calls. `to_native` puts a path under your folder, and refuses the names that Windows treats in its own
+way (`C:`, `..\x`, `CON`, `aux.txt`, a name that ends with a dot):
+
+```rust,ignore
+let place = path.to_native(&self.root).map_err(|_| FsError::NameNotAllowed)?;
+let file = tokio::fs::File::create(&place).await?;
+```
+
+An upload that does not complete must leave nothing behind: `write` is dropped when the client aborts or the connection is cut, so write to a temporary
+file and rename it when `write` has read all the data (the example does).
+
+## Offer FTPS
+
+Build a `rustls::ServerConfig` with your certificate and give it to the library. With `require_tls` a client must use `AUTH TLS` before it signs in, and
+`PROT P` before it moves data:
+
+```rust,no_run
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::sync::Arc;
+use thirtyftp::Config;
+
+fn config() -> Result<Config, Box<dyn std::error::Error>> {
+    let certificates = CertificateDer::pem_file_iter("cert.pem")?.collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_file("key.pem")?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)?;
+
+    let mut config = Config::default();
+    config.tls = Some(Arc::new(tls));
+    config.require_tls = true;
+    Ok(config)
+}
+```
+
+The library asks rustls for no crypto provider: use `aws-lc-rs` or `ring`, whichever your program has. Many old scanners and cameras speak TLS 1.2 only; enable
+the `tls12` feature of rustls for them.
+
+## Behind NAT, a firewall or Docker
+
+A client connects its data connection to a port of the server. Choose the ports, publish them, and tell clients which address to use:
+
+```rust,no_run
+use thirtyftp::{Config, PassiveHost};
+
+fn main() {
+    let mut config = Config::default();
+    config.passive_ports = 50000..=50100;
+    config.passive_host = PassiveHost::Dns("ftp.example.com".to_string());
+}
+```
+
+```sh
+docker run -p 2121:2121 -p 50000-50100:50000-50100 my-ftp-server
+```
+
+`PassiveHost::Ip(..)` gives an address, and `PassiveHost::FromConnection` (the default) the address the client connected to.
+
+## Limit the connections and see what happens
+
+The library serves the connections it is given. Counting them, and refusing the ones that are too many, is yours; `Events` tells you about sign-ins and
+transfers:
+
+```rust,no_run
+use std::net::SocketAddr;
+use std::sync::Arc;
+use thirtyftp::{Events, TransferEnd, TransferInfo};
+use tokio::sync::Semaphore;
+
+struct Log;
+
+impl Events for Log {
+    fn signed_in(&self, peer: SocketAddr, user: &str) {
+        println!("{peer}: {user} signed in");
+    }
+
+    fn login_failed(&self, peer: SocketAddr, user: &str) {
+        println!("{peer}: sign-in as {user} failed");
+    }
+
+    fn transfer_ended(&self, peer: SocketAddr, _user: &str, transfer: &TransferInfo, end: &TransferEnd) {
+        println!("{peer}: {:?} {}: {end:?}", transfer.direction, transfer.path);
+    }
+}
+
+fn main() {
+    // In the loop that accepts: `let Ok(permit) = permits.clone().try_acquire_owned() else { continue };`, and drop the permit when the session ends
+    let permits = Arc::new(Semaphore::new(100));
+    let events: Arc<dyn Events> = Arc::new(Log);
+    let _ = (permits, events);
+}
+```
+
+## Settings
+
+`Config::default()` is a sensible start: a 5-minute idle time, 3 sign-in attempts, 60 seconds to sign in, passive ports 49152 to 65535. Change what you need:
+
+```rust,no_run
+use std::time::Duration;
+use thirtyftp::Config;
+
+fn main() {
+    let mut config = Config::default();
+    config.greeting = "Scan here".to_string();
+    config.idle_timeout = Duration::from_secs(120);
+    config.limits.max_login_attempts = 5;
+    config.limits.login_timeout = Duration::from_secs(20);
+    config.limits.max_transfer_time = Some(Duration::from_secs(3600));
+    config.ascii_conversion = true; // CRLF <-> LF for TYPE A; off keeps the bytes as they are
+    config.active_mode = false; // PORT and EPRT, only to the client's own address and ports from 1024 up
+}
+```
+
+Every setting is documented on `Config` and `Limits` in the crate documentation.
+
+## Good to know
+
+- A backend's `write` reads to the end of the data, and keeps nothing if it is dropped or fails. The size of a file is the backend's to limit.
+- `QUIT` or a closed control connection lets a transfer that has its data finish, so a camera that doesn't wait for the `226` doesn't lose its file.
+- A connection from another address than the client's is never used as its data connection. Two clients behind one NAT address could race for a passive
+  port; give them separate port ranges, or use FTPS on a network where the address is the client.
+- The host counts connections and failed sign-ins per address; the library closes a connection after 3 failed sign-ins.
+- The specifications followed, row by row with the tests that show them, are on the `conformance` page of the crate documentation.
+
+## Contributing
+
+See [CONTRIBUTING](.github/CONTRIBUTING.md). Security problems are reported privately: [SECURITY](.github/SECURITY.md).
 
 ## Licence
 
