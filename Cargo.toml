@@ -1,0 +1,20 @@
+[package]
+name = "thirtyftp"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A small FTP and FTPS (explicit TLS) server library for receive folders: passive mode, uploads, optional listing and downloads"
+license = "Apache-2.0"
+repository = "https://github.com/ThirtyFile/ThirtyFTP"
+readme = "README.md"
+keywords = ["ftp", "ftps", "server", "tokio", "rustls"]
+categories = ["network-programming"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
