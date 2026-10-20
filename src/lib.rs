@@ -64,7 +64,7 @@
 //!
 //! # Specifications
 //!
-//! RFC 959 and RFC 1123 section 4.1 are the base; the README has the table that says, for each requirement, what is done. RFC 2228 and 4217 (FTPS),
+//! RFC 959 and RFC 1123 section 4.1 are the base; the [`conformance`] page has the tables that say, for each requirement, what is done. RFC 2228 and 4217 (FTPS),
 //! RFC 2428 (EPSV and EPRT), RFC 2389 (FEAT and OPTS), RFC 3659 (SIZE, MDTM, MLST, MLSD and REST), RFC 2640 (UTF-8), RFC 2577 (security) and RFC 8446
 //! section 6.1 (`close_notify`) are used where they apply, and the documentation of each module names the sections.
 
@@ -84,6 +84,7 @@ mod clock;
 mod codec;
 mod command;
 mod config;
+pub mod conformance;
 mod events;
 mod listing;
 mod passive;
@@ -102,6 +103,11 @@ pub use session::{SessionEnd, serve};
 
 #[cfg(test)]
 mod properties;
+
+// The examples of the README are compiled by `cargo test --doc`
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
 
 /// Entry points for the fuzz targets in `fuzz/`: built only when fuzzing (`--cfg fuzzing`, which cargo-fuzz sets), and not part of the library
 #[cfg(fuzzing)]

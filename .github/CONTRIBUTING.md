@@ -19,9 +19,9 @@ Security problems are reported privately: see the [security policy](SECURITY.md)
    cargo test --locked
    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
    ```
-   Pull requests run the same on Linux and Windows, real clients (curl, Python's ftplib and lftp) against the example server, the build of the fuzz crate, `cargo package` and `cargo deny`. The fuzz targets run weekly (**Actions > Fuzz > Run workflow** runs them now).
+   The examples in `README.md` are compiled by `cargo test`: keep them working. Pull requests run the same on Linux and Windows, real clients (curl, Python's ftplib and lftp) against the example server, the build of the fuzz crate, `cargo package` and `cargo deny`. The fuzz targets run weekly (**Actions > Fuzz > Run workflow** runs them now).
 4. Open a pull request with a title that says what changes, one label (`enhancement`, `bug`, `performance`, `documentation`, `dependencies` or `maintenance`), and `Closes #123` in the description. Pull requests are squash-merged.
 
-Code, comments and documentation are written in English. A new command or behaviour gets its row in the conformance tables of the README, with the tests that show it (a test of this repository checks that they exist). The documentation of a module names the sections of the RFCs it follows.
+Code, comments and documentation are written in English. A new command or behaviour gets its row in the conformance tables (`src/conformance.rs`, shown as the `conformance` page of the crate documentation), with the tests that show it (a test of this repository checks that they exist). The documentation of a module names the sections of the RFCs it follows.
 
 By contributing, you agree that your contribution is licensed under the [Apache License 2.0](../LICENSE), and you agree to follow the [code of conduct](CODE_OF_CONDUCT.md).
