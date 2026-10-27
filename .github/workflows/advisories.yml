@@ -1,0 +1,33 @@
+# Checks the locked dependencies (the library's and the fuzz crate's) against the RustSec advisories every week, and by hand (Actions > Advisories >
+# Run workflow). checks.yml runs cargo deny only when something is pushed; a new advisory about a version we already use would show up only
+# with the next pull request. A failed run is the notice: the log lists the advisory, the crate and the version that fixes it.
+name: Advisories
+
+on:
+  # When this file or the configuration of cargo deny changes: the new workflow is tried in its pull request
+  pull_request:
+    paths: [".github/workflows/advisories.yml", "deny.toml"]
+  schedule:
+    - cron: "30 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      - name: The library
+        run: cargo deny --config deny.toml check advisories
+      - name: The fuzz crate
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check advisories
