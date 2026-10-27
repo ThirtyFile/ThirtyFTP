@@ -174,9 +174,13 @@ async fn nobody_listening_is_425() {
     let server = active_server().await;
     let mut client = Client::connect(&server).await;
     client.login().await;
-    let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+    // A port that is ours and not listening: nobody else can be given it while the socket is held, and a connection to it is refused
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
     assert_eq!(client.code(&format!("PORT 127,0,0,1,{},{}", port >> 8, port & 0xff)).await, 200);
     assert_eq!(client.code("STOR a.txt").await, 425, "no 150: the data connection was never open");
+    drop(socket);
     assert!(server.backend.files.lock().unwrap().is_empty());
     assert_eq!(client.code("NOOP").await, 200);
 }
