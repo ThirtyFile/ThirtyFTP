@@ -23,9 +23,9 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-fuzz
+      # Built from crates.io for the runner's own (gnu) target, at a version of ours. install-action has no cargo-fuzz: it falls back to a static musl binary,
+      # which cannot build with a sanitizer. Raise the version by hand
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
       - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
