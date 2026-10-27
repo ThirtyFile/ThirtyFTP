@@ -153,8 +153,13 @@ mod tests {
 
     #[tokio::test]
     async fn connect_fails_when_nobody_listens() {
-        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
-        let result = connect("127.0.0.1".parse().unwrap(), SocketAddr::from(([127, 0, 0, 1], port)), Instant::now() + Duration::from_secs(5)).await;
+        // A port that is ours and not listening: nobody else can be given it while the socket is held (a port that was freed a moment before could be),
+        // and a connection to it is refused
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap();
+        let result = connect("127.0.0.1".parse().unwrap(), address, Instant::now() + Duration::from_secs(5)).await;
         assert!(result.is_err());
+        drop(socket);
     }
 }
